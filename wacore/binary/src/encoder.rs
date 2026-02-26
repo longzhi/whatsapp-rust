@@ -1,9 +1,5 @@
 use std::io::Write;
 
-use core::simd::Select;
-use core::simd::prelude::*;
-use core::simd::{Simd, u8x16};
-
 use crate::error::{BinaryError, Result};
 use crate::jid::{self, Jid, JidRef};
 use crate::node::{Node, NodeContent, NodeContentRef, NodeRef, NodeValue, ValueRef};
@@ -804,55 +800,15 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
         }
         self.write_u8(rounded_len)?;
 
-        let mut input_bytes = value.as_bytes();
+        let input_bytes = value.as_bytes();
 
         if data_type == token::NIBBLE_8 {
-            const NIBBLE_LOOKUP: [u8; 16] =
-                [10, 11, 255, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 255, 255, 255];
-            let lookup = Simd::from_array(NIBBLE_LOOKUP);
-            let nibble_base = Simd::splat(b'-');
-
-            while input_bytes.len() >= 16 {
-                let (chunk, rest) = input_bytes.split_at(16);
-                let input = u8x16::from_slice(chunk);
-                let indices = input.saturating_sub(nibble_base);
-                let nibbles = lookup.swizzle_dyn(indices);
-
-                let (evens, odds) = nibbles.deinterleave(nibbles.rotate_elements_left::<1>());
-                let packed: Simd<u8, 16> = (evens << Simd::splat(4)) | odds;
-                let packed_bytes = packed.to_array();
-                self.write_raw_bytes(&packed_bytes[..8])?;
-
-                input_bytes = rest;
-            }
-
             let mut bytes_iter = input_bytes.iter().copied();
             while let Some(part1) = bytes_iter.next() {
                 let part2 = bytes_iter.next().unwrap_or(0);
                 self.write_u8(Self::pack_byte_pair(Self::pack_nibble, part1, part2))?;
             }
         } else {
-            let ascii_0 = Simd::splat(b'0');
-            let ascii_a = Simd::splat(b'A');
-            let ten = Simd::splat(10);
-
-            while input_bytes.len() >= 16 {
-                let (chunk, rest) = input_bytes.split_at(16);
-                let input = u8x16::from_slice(chunk);
-
-                let digit_vals = input - ascii_0;
-                let letter_vals = input - ascii_a + ten;
-                let is_letter = input.simd_ge(ascii_a);
-                let nibbles = is_letter.select(letter_vals, digit_vals);
-
-                let (evens, odds) = nibbles.deinterleave(nibbles.rotate_elements_left::<1>());
-                let packed: Simd<u8, 16> = (evens << Simd::splat(4)) | odds;
-                let packed_bytes = packed.to_array();
-                self.write_raw_bytes(&packed_bytes[..8])?;
-
-                input_bytes = rest;
-            }
-
             let mut bytes_iter = input_bytes.iter().copied();
             while let Some(part1) = bytes_iter.next() {
                 let part2 = bytes_iter.next().unwrap_or(0);
