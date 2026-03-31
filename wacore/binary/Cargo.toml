@@ -14,7 +14,7 @@ ignored = ["phf"]
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["simd"]
+default = []
 simd = []
 serde = ["dep:serde"]
 
