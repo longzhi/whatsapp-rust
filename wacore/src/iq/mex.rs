@@ -48,10 +48,15 @@ impl MexGraphQLError {
     }
 
     #[inline]
-    pub fn is_fatal(&self) -> bool {
+    pub fn is_summary(&self) -> bool {
         self.extensions
             .as_ref()
             .is_some_and(|ext| ext.is_summary == Some(true))
+    }
+
+    #[inline]
+    pub fn has_error_code(&self) -> bool {
+        self.error_code().is_some()
     }
 }
 
@@ -73,8 +78,20 @@ impl MexResponse {
         self.errors.as_ref().is_some_and(|e| !e.is_empty())
     }
 
+    /// Find a fatal error, matching WhatsApp Web's `parseFatalExtensionError`:
+    /// 1. Error with `is_summary == true`
+    /// 2. OR any error with an `error_code`
+    /// 3. OR the first error (assigned code 500)
     pub fn fatal_error(&self) -> Option<&MexGraphQLError> {
-        self.errors.as_ref()?.iter().find(|e| e.is_fatal())
+        let errors = self.errors.as_ref()?;
+        if errors.is_empty() {
+            return None;
+        }
+        errors
+            .iter()
+            .find(|e| e.is_summary())
+            .or_else(|| errors.iter().find(|e| e.has_error_code()))
+            .or_else(|| errors.first())
     }
 }
 
@@ -171,9 +188,11 @@ mod tests {
         if let Some(NodeContent::Nodes(nodes)) = &iq.content {
             assert_eq!(nodes.len(), 1);
             assert_eq!(nodes[0].tag, "query");
-            assert_eq!(
-                nodes[0].attrs.get("query_id").and_then(|s| s.as_str()),
-                Some("29829202653362039")
+            assert!(
+                nodes[0]
+                    .attrs
+                    .get("query_id")
+                    .is_some_and(|s| s == "29829202653362039")
             );
         } else {
             panic!("Expected NodeContent::Nodes");
@@ -222,7 +241,7 @@ mod tests {
         let fatal = fatal.unwrap();
         assert_eq!(fatal.message, "Fatal server error");
         assert_eq!(fatal.error_code(), Some(500));
-        assert!(fatal.is_fatal());
+        assert!(fatal.is_summary());
     }
 
     #[test]
@@ -238,6 +257,6 @@ mod tests {
         };
 
         assert_eq!(error.error_code(), Some(404));
-        assert!(!error.is_fatal());
+        assert!(!error.is_summary());
     }
 }

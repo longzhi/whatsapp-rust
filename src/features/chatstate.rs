@@ -8,6 +8,7 @@ use wacore_binary::jid::Jid;
 
 /// Chat state type for typing indicators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, StringEnum)]
+#[non_exhaustive]
 pub enum ChatStateType {
     #[str = "composing"]
     Composing,
@@ -61,7 +62,7 @@ impl<'a> Chatstate<'a> {
         };
 
         NodeBuilder::new("chatstate")
-            .attr("to", to.to_string())
+            .attr("to", to.clone())
             .children([child])
             .build()
     }

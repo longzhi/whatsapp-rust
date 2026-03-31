@@ -1,3 +1,6 @@
+pub mod keepalive;
+pub mod retry;
+
 use anyhow::Result;
 use wacore_binary::node::Node;
 
@@ -11,6 +14,21 @@ pub trait ProtocolNode: Sized {
 
     /// Parse a protocol `Node` into the struct.
     fn try_from_node(node: &Node) -> Result<Self>;
+}
+
+/// Trait for parsing a string enum from a `&str`.
+///
+/// Automatically implemented by the `StringEnum` derive macro for both
+/// standard enums (fails on unknown) and fallback enums (captures unknown).
+pub trait ParseStringEnum: Sized {
+    fn parse_from_str(s: &str) -> Result<Self>;
+}
+
+/// Parse a string enum value from a `&str`.
+///
+/// Used by the `ProtocolNode` derive macro for `#[attr(string_enum)]` fields.
+pub fn parse_string_enum<T: ParseStringEnum>(s: &str) -> Result<T> {
+    T::parse_from_str(s)
 }
 
 /// Macro for defining simple protocol nodes with only attributes (no children).

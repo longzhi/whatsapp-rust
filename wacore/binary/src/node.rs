@@ -1,6 +1,24 @@
 use crate::attrs::{AttrParser, AttrParserRef};
 use crate::jid::{Jid, JidRef};
+use crate::token;
 use std::borrow::Cow;
+
+/// Intern a string as a `Cow::Borrowed(&'static str)` if it matches a known token,
+/// otherwise allocate a `Cow::Owned(String)`. This avoids heap allocations for the
+/// vast majority of tag names and attribute keys which are protocol tokens.
+#[inline]
+fn intern_cow(s: &str) -> Cow<'static, str> {
+    if let Some(idx) = token::index_of_single_token(s)
+        && let Some(token) = token::get_single_token(idx)
+    {
+        return Cow::Borrowed(token);
+    } else if let Some((dict, idx)) = token::index_of_double_byte_token(s)
+        && let Some(token) = token::get_double_token(dict, idx)
+    {
+        return Cow::Borrowed(token);
+    }
+    Cow::Owned(s.to_string())
+}
 
 /// An owned attribute value that can be either a string or a structured JID.
 /// This avoids string allocation for JID attributes by storing the JID directly,
@@ -19,21 +37,14 @@ impl Default for NodeValue {
 }
 
 impl NodeValue {
-    /// Get the value as a string slice, if it's a string variant.
+    /// String view of the value. Works for both variants.
+    /// - String variant: Cow::Borrowed(&str) — zero copy
+    /// - Jid variant: Cow::Owned(formatted) — allocates only when needed
     #[inline]
-    pub fn as_str(&self) -> Option<&str> {
+    pub fn as_str(&self) -> Cow<'_, str> {
         match self {
-            NodeValue::String(s) => Some(s.as_ref()),
-            NodeValue::Jid(_) => None,
-        }
-    }
-
-    /// Get the value as a Jid reference, if it's a JID variant.
-    #[inline]
-    pub fn as_jid(&self) -> Option<&Jid> {
-        match self {
-            NodeValue::Jid(j) => Some(j),
-            NodeValue::String(_) => None,
+            NodeValue::String(s) => Cow::Borrowed(s.as_str()),
+            NodeValue::Jid(j) => Cow::Owned(j.to_string()),
         }
     }
 
@@ -43,15 +54,6 @@ impl NodeValue {
         match self {
             NodeValue::Jid(j) => Some(j.clone()),
             NodeValue::String(s) => s.parse().ok(),
-        }
-    }
-
-    /// Convert to a string, formatting the JID if necessary.
-    #[inline]
-    pub fn to_string_value(&self) -> String {
-        match self {
-            NodeValue::String(s) => s.clone(),
-            NodeValue::Jid(j) => j.to_string(),
         }
     }
 }
@@ -71,9 +73,37 @@ impl PartialEq<str> for NodeValue {
     fn eq(&self, other: &str) -> bool {
         match self {
             NodeValue::String(s) => s == other,
-            // For JID, format and compare. This is rare since JIDs are typically
-            // accessed via optional_jid() or to_jid(), not string comparison.
-            NodeValue::Jid(j) => j.to_string() == other,
+            // Compare JID to string without heap allocation by streaming the
+            // Display output through a writer that checks byte-by-byte.
+            NodeValue::Jid(j) => {
+                use std::fmt::Write;
+                struct EqCheck<'a> {
+                    target: &'a [u8],
+                    pos: usize,
+                    matches: bool,
+                }
+                impl fmt::Write for EqCheck<'_> {
+                    fn write_str(&mut self, s: &str) -> fmt::Result {
+                        if !self.matches {
+                            return Ok(());
+                        }
+                        let bytes = s.as_bytes();
+                        let end = self.pos + bytes.len();
+                        if end > self.target.len() || self.target[self.pos..end] != *bytes {
+                            self.matches = false;
+                        }
+                        self.pos = end;
+                        Ok(())
+                    }
+                }
+                let mut check = EqCheck {
+                    target: other.as_bytes(),
+                    pos: 0,
+                    matches: true,
+                };
+                let _ = write!(check, "{}", j);
+                check.matches && check.pos == other.len()
+            }
         }
     }
 }
@@ -104,6 +134,13 @@ impl From<&str> for NodeValue {
     }
 }
 
+impl From<&String> for NodeValue {
+    #[inline]
+    fn from(s: &String) -> Self {
+        NodeValue::String(s.clone())
+    }
+}
+
 impl From<Jid> for NodeValue {
     #[inline]
     fn from(jid: Jid) -> Self {
@@ -114,9 +151,11 @@ impl From<Jid> for NodeValue {
 /// A collection of node attributes stored as key-value pairs.
 /// Uses a Vec internally for better cache locality with small attribute counts (typically 3-6).
 /// Values can be either strings or JIDs, avoiding stringification overhead for JID attributes.
+/// Keys use `Cow<'static, str>` to avoid heap allocation for compile-time-known strings
+/// (e.g., "type", "id", "to") which are the vast majority of attribute keys.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct Attrs(pub Vec<(String, NodeValue)>);
+pub struct Attrs(pub Vec<(Cow<'static, str>, NodeValue)>);
 
 impl Attrs {
     #[inline]
@@ -144,7 +183,8 @@ impl Attrs {
 
     /// Insert a key-value pair. If the key already exists, update the value.
     #[inline]
-    pub fn insert(&mut self, key: String, value: impl Into<NodeValue>) {
+    pub fn insert(&mut self, key: impl Into<Cow<'static, str>>, value: impl Into<NodeValue>) {
+        let key = key.into();
         let value = value.into();
         if let Some(pos) = self.0.iter().position(|(k, _)| k == &key) {
             self.0[pos].1 = value;
@@ -165,35 +205,35 @@ impl Attrs {
 
     /// Iterate over key-value pairs.
     #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &NodeValue)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&Cow<'static, str>, &NodeValue)> {
         self.0.iter().map(|(k, v)| (k, v))
     }
 
     /// Push a key-value pair without checking for duplicates.
     /// Use this when building from a known-unique source (e.g., decoding).
     #[inline]
-    pub fn push(&mut self, key: String, value: impl Into<NodeValue>) {
-        self.0.push((key, value.into()));
+    pub fn push(&mut self, key: impl Into<Cow<'static, str>>, value: impl Into<NodeValue>) {
+        self.0.push((key.into(), value.into()));
     }
 
     /// Push a NodeValue directly without conversion.
     /// Slightly more efficient when you already have a NodeValue.
     #[inline]
-    pub fn push_value(&mut self, key: String, value: NodeValue) {
-        self.0.push((key, value));
+    pub fn push_value(&mut self, key: impl Into<Cow<'static, str>>, value: NodeValue) {
+        self.0.push((key.into(), value));
     }
 
     /// Iterate over keys only.
     #[inline]
-    pub fn keys(&self) -> impl Iterator<Item = &String> {
+    pub fn keys(&self) -> impl Iterator<Item = &Cow<'static, str>> {
         self.0.iter().map(|(k, _)| k)
     }
 }
 
 /// Owned iterator implementation (consuming).
 impl IntoIterator for Attrs {
-    type Item = (String, NodeValue);
-    type IntoIter = std::vec::IntoIter<(String, NodeValue)>;
+    type Item = (Cow<'static, str>, NodeValue);
+    type IntoIter = std::vec::IntoIter<(Cow<'static, str>, NodeValue)>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
@@ -202,10 +242,10 @@ impl IntoIterator for Attrs {
 
 /// Borrowed iterator implementation.
 impl<'a> IntoIterator for &'a Attrs {
-    type Item = (&'a String, &'a NodeValue);
+    type Item = (&'a Cow<'static, str>, &'a NodeValue);
     type IntoIter = std::iter::Map<
-        std::slice::Iter<'a, (String, NodeValue)>,
-        fn(&'a (String, NodeValue)) -> (&'a String, &'a NodeValue),
+        std::slice::Iter<'a, (Cow<'static, str>, NodeValue)>,
+        fn(&'a (Cow<'static, str>, NodeValue)) -> (&'a Cow<'static, str>, &'a NodeValue),
     >;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -213,8 +253,8 @@ impl<'a> IntoIterator for &'a Attrs {
     }
 }
 
-impl FromIterator<(String, NodeValue)> for Attrs {
-    fn from_iter<I: IntoIterator<Item = (String, NodeValue)>>(iter: I) -> Self {
+impl FromIterator<(Cow<'static, str>, NodeValue)> for Attrs {
+    fn from_iter<I: IntoIterator<Item = (Cow<'static, str>, NodeValue)>>(iter: I) -> Self {
         Self(iter.into_iter().collect())
     }
 }
@@ -308,7 +348,7 @@ impl NodeContent {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Node {
-    pub tag: String,
+    pub tag: Cow<'static, str>,
     pub attrs: Attrs,
     pub content: Option<NodeContent>,
 }
@@ -321,9 +361,13 @@ pub struct NodeRef<'a> {
 }
 
 impl Node {
-    pub fn new(tag: &str, attrs: Attrs, content: Option<NodeContent>) -> Self {
+    pub fn new(
+        tag: impl Into<Cow<'static, str>>,
+        attrs: Attrs,
+        content: Option<NodeContent>,
+    ) -> Self {
         Self {
-            tag: tag.to_string(),
+            tag: tag.into(),
             attrs,
             content,
         }
@@ -333,7 +377,7 @@ impl Node {
     /// The returned NodeRef borrows from self.
     pub fn as_node_ref(&self) -> NodeRef<'_> {
         NodeRef {
-            tag: Cow::Borrowed(&self.tag),
+            tag: Cow::Borrowed(self.tag.as_ref()),
             attrs: self
                 .attrs
                 .iter()
@@ -348,7 +392,7 @@ impl Node {
                             integrator: j.integrator,
                         }),
                     };
-                    (Cow::Borrowed(k.as_str()), value_ref)
+                    (Cow::Borrowed(k.as_ref()), value_ref)
                 })
                 .collect(),
             content: self.content.as_ref().map(|c| Box::new(c.as_content_ref())),
@@ -460,7 +504,7 @@ impl<'a> NodeRef<'a> {
 
     pub fn to_owned(&self) -> Node {
         Node {
-            tag: self.tag.to_string(),
+            tag: intern_cow(&self.tag),
             attrs: self
                 .attrs
                 .iter()
@@ -469,7 +513,7 @@ impl<'a> NodeRef<'a> {
                         ValueRef::String(s) => NodeValue::String(s.to_string()),
                         ValueRef::Jid(j) => NodeValue::Jid(j.to_owned()),
                     };
-                    (k.to_string(), value)
+                    (intern_cow(k), value)
                 })
                 .collect::<Attrs>(),
             content: self.content.as_deref().map(|c| match c {

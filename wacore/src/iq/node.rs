@@ -3,6 +3,8 @@
 //! These functions provide a consistent way to extract required and optional
 //! children/attributes from protocol nodes with clear error messages.
 
+use std::borrow::Cow;
+
 use crate::protocol::ProtocolNode;
 use anyhow::anyhow;
 use wacore_binary::jid::Jid;
@@ -20,15 +22,18 @@ pub fn optional_child<'a>(node: &'a Node, tag: &str) -> Option<&'a Node> {
 }
 
 /// Get a required string attribute, returning an error if not found.
+///
+/// Handles both string and JID-typed attribute values transparently:
+/// JID values are formatted to their string representation.
 pub fn required_attr(node: &Node, key: &str) -> Result<String, anyhow::Error> {
-    node.attrs()
-        .optional_string(key)
-        .map(str::to_string)
+    node.attrs
+        .get(key)
+        .map(|v| v.to_string())
         .ok_or_else(|| anyhow!("missing required attribute {key}"))
 }
 
 /// Get an optional string attribute.
-pub fn optional_attr<'a>(node: &'a Node, key: &str) -> Option<&'a str> {
+pub fn optional_attr<'a>(node: &'a Node, key: &str) -> Option<Cow<'a, str>> {
     node.attrs().optional_string(key)
 }
 

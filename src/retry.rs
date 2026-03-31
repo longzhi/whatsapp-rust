@@ -3,7 +3,8 @@ use crate::message::RetryReason;
 use crate::types::events::Receipt;
 use log::{info, warn};
 use prost::Message;
-use rand::TryRngCore;
+use wacore::types::message::MessageCategory;
+
 use scopeguard;
 use std::sync::Arc;
 use wacore::iq::prekeys::{OneTimePreKeyNode, SignedPreKeyNode};
@@ -11,7 +12,6 @@ use wacore::libsignal::protocol::{
     KeyPair, PreKeyBundle, PublicKey, UsePQRatchet, process_prekey_bundle,
 };
 use wacore::libsignal::store::PreKeyStore;
-use wacore::libsignal::store::SessionStore;
 use wacore::protocol::ProtocolNode;
 use wacore::types::jid::JidExt;
 use wacore_binary::builder::NodeBuilder;
@@ -88,26 +88,32 @@ impl Client {
             return Ok(());
         }
 
+        let is_group_or_status =
+            receipt.source.chat.is_group() || receipt.source.chat.is_status_broadcast();
+
+        // For groups/status broadcasts, the actual participant is in the
+        // `participant` attribute of the receipt node, NOT receipt.source.sender
+        // (which may be the group/broadcast JID for non-group servers).
+        let participant_str = if is_group_or_status {
+            node.attrs()
+                .optional_string("participant")
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| receipt.source.sender.to_string())
+        } else {
+            receipt.source.sender.to_string()
+        };
+
         // Deduplicate retry receipts to prevent processing the same retry multiple times.
-        // For groups: key is (chat, msg_id, sender) since each participant retries independently.
+        // For groups/status: key includes participant since each device retries independently.
         // For DMs: key is (chat, msg_id) since there's only one sender.
         // Uses atomic entry API to avoid race conditions between check and insert.
-        let dedupe_key = if receipt.source.chat.is_group() {
-            format!(
-                "{}:{}:{}",
-                receipt.source.chat, message_id, receipt.source.sender
-            )
+        let dedupe_key = if is_group_or_status {
+            format!("{}:{}:{}", receipt.source.chat, message_id, participant_str)
         } else {
             format!("{}:{}", receipt.source.chat, message_id)
         };
 
-        let entry = self
-            .retried_group_messages
-            .entry(dedupe_key.clone())
-            .or_insert(())
-            .await;
-
-        if !entry.is_fresh() {
+        if self.retried_group_messages.get(&dedupe_key).await.is_some() {
             log::debug!(
                 "Ignoring duplicate retry for message {} from {}: already handled.",
                 message_id,
@@ -115,20 +121,27 @@ impl Client {
             );
             return Ok(());
         }
+        self.retried_group_messages
+            .insert(dedupe_key.clone(), ())
+            .await;
 
-        // Prevent concurrent retries for the same message.
+        // Prevent concurrent retries for the same message+participant.
+        if !self
+            .pending_retries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(dedupe_key.clone())
         {
-            let mut pending = self.pending_retries.lock().await;
-            if pending.contains(&message_id) {
-                log::debug!("Ignoring retry for {message_id}: a retry is already in progress.");
-                return Ok(());
-            }
-            pending.insert(message_id.clone());
+            log::debug!("Ignoring retry for {dedupe_key}: a retry is already in progress.");
+            return Ok(());
         }
-        let _guard = scopeguard::guard((self.clone(), message_id.clone()), |(client, id)| {
-            tokio::spawn(async move {
-                client.pending_retries.lock().await.remove(&id);
-            });
+        let pending = Arc::clone(&self.pending_retries);
+        let guard_key = dedupe_key.clone();
+        let _guard = scopeguard::guard((), move |()| {
+            pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&guard_key);
         });
 
         let original_msg = match self
@@ -144,7 +157,23 @@ impl Client {
             }
         };
 
-        let participant_jid = receipt.source.sender.clone();
+        // Re-add for groups/status so other participants can also retry.
+        // take_recent_message consumed it; without this a second participant's
+        // retry would silently fail with "not found in cache".
+        if is_group_or_status {
+            self.add_recent_message(
+                receipt.source.chat.clone(),
+                message_id.clone(),
+                &original_msg,
+            )
+            .await;
+        }
+
+        // Reuse the participant string extracted earlier (same source: node's
+        // `participant` attribute for groups/status, receipt.source.sender for DMs).
+        let participant_jid = participant_str
+            .parse::<wacore_binary::jid::Jid>()
+            .unwrap_or_else(|_| receipt.source.sender.clone());
 
         // Device existence check (matches WhatsApp Web's WAWebApiDeviceList.hasDevice).
         // This prevents processing retry receipts from unknown/stale devices.
@@ -165,13 +194,10 @@ impl Client {
             .as_ref()
             .is_some_and(|our_pn| participant_jid.user == our_pn.user);
 
-        // Process the key bundle from the retry receipt to establish a fresh session.
-        // The requester includes their new prekeys so we can encrypt to them.
-        // This is only done for DMs; group messages and status broadcasts use sender keys instead.
-        let is_group_or_status =
-            receipt.source.chat.is_group() || receipt.source.chat.is_status_broadcast();
-
-        if !is_group_or_status {
+        // Process key bundle to establish a pairwise session for the retry.
+        // Needed for both DMs and groups (group retries use pairwise, not sender key).
+        // Status broadcasts skip this — they can't resend and only mark for next send.
+        if !receipt.source.chat.is_status_broadcast() {
             // Try to process key bundle if present
             let key_bundle_result = self
                 .process_retry_key_bundle(node, &participant_jid, is_peer)
@@ -191,46 +217,133 @@ impl Client {
                     let device_store = self.persistence_manager.get_device_arc().await;
                     let device_guard = device_store.read().await;
 
-                    if let Ok(session) = device_guard.load_session(&signal_address).await
+                    // Read session through cache to get consistent state
+                    let session = self
+                        .signal_cache
+                        .get_session(&signal_address, &*device_guard.backend)
+                        .await
+                        .ok()
+                        .flatten();
+                    drop(device_guard);
+
+                    if let Some(session) = session
                         && let Ok(stored_reg_id) = session.remote_registration_id()
                         && stored_reg_id != 0
                         && stored_reg_id != received_reg_id
                     {
-                        drop(device_guard);
                         info!(
                             "Registration ID mismatch for {} (stored: {}, received: {}). \
                              Deleting session since no key bundle provided.",
                             signal_address, stored_reg_id, received_reg_id
                         );
-                        if let Err(del_err) = device_store
-                            .write()
-                            .await
-                            .delete_session(&signal_address)
-                            .await
-                        {
-                            warn!("Failed to delete session for reg ID mismatch: {}", del_err);
-                        }
+                        self.signal_cache.delete_session(&signal_address).await;
+                        self.flush_signal_cache().await.unwrap_or_else(|e| {
+                            log::warn!("Failed to flush session deletion for reg ID mismatch: {e}");
+                        });
                     }
                 }
             }
         }
 
-        if is_group_or_status {
-            // For groups and status broadcasts, mark participant as needing fresh SKDM.
-            // WhatsApp Web uses `markForgetSenderKey` which lazily marks participants for
-            // SKDM redistribution on the next send, rather than immediately deleting
-            // the sender key.
-            let group_jid = receipt.source.chat.to_string();
-            let participant_str = participant_jid.to_string();
+        // Fetch group info (cache-first, server on miss) — used for SKDM rotation + addressing_mode.
+        // Without this, a cold cache would silently default to PN semantics for LID groups.
+        let cached_group_info = if receipt.source.chat.is_group() {
+            match self.groups().query_info(&receipt.source.chat).await {
+                Ok(info) => Some(info),
+                Err(e) => {
+                    log::warn!(
+                        "Failed to fetch group info for retry of msg {} in {}: {e}",
+                        message_id,
+                        receipt.source.chat
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
-            // Mark this participant as needing fresh SKDM (filters out own devices internally)
+        if is_group_or_status {
+            let group_jid = receipt.source.chat.to_string();
+
+            // WA Web rotateKey: unknown device (not in participant list, not LID) →
+            // force full sender key rotation by clearing all sender key device tracking.
+            if !participant_jid.is_lid() && !receipt.source.chat.is_status_broadcast() {
+                // If we can't verify membership (no cached group info), treat
+                // as unknown and trigger rotation (matches WA Web where the
+                // device wouldn't be in the senderKey map → rotateKey=true)
+                let is_known_participant = cached_group_info.as_ref().is_some_and(|g| {
+                    g.participants
+                        .iter()
+                        .any(|p| p.user == participant_jid.user)
+                });
+
+                if !is_known_participant {
+                    log::warn!(
+                        "Unknown device {} in group {} — forcing full sender key rotation \
+                         (matches WA Web's rotateKey behavior)",
+                        participant_str,
+                        group_jid
+                    );
+
+                    // WA Web: deleteGroupSenderKeyInfo(groupWid, ownWid)
+                    // Delete our own sender key for forward secrecy.
+                    // When addressing mode is known, delete only that namespace.
+                    // When unknown (group info unavailable), delete both PN and LID
+                    // to ensure the active key is removed regardless of mode.
+                    let addressing_mode = cached_group_info.as_ref().map(|g| g.addressing_mode);
+
+                    let jids_to_delete: Vec<_> = match addressing_mode {
+                        Some(wacore::types::message::AddressingMode::Lid) => {
+                            device_snapshot.lid.as_ref().into_iter().collect()
+                        }
+                        Some(wacore::types::message::AddressingMode::Pn) => {
+                            device_snapshot.pn.as_ref().into_iter().collect()
+                        }
+                        None => {
+                            // Can't determine mode — delete both namespaces
+                            device_snapshot
+                                .lid
+                                .as_ref()
+                                .into_iter()
+                                .chain(device_snapshot.pn.as_ref())
+                                .collect()
+                        }
+                    };
+
+                    for own_jid in jids_to_delete {
+                        use wacore::libsignal::store::sender_key_name::SenderKeyName;
+                        let sk_name = SenderKeyName::new(
+                            group_jid.clone(),
+                            own_jid.to_protocol_address().to_string(),
+                        );
+                        self.signal_cache
+                            .delete_sender_key(sk_name.cache_key())
+                            .await;
+                    }
+
+                    // Clear DB first, then invalidate cache. This order prevents
+                    // a concurrent resolve_skdm_targets from reading stale DB rows
+                    // and re-inserting them into cache after invalidation.
+                    if let Err(e) = self
+                        .persistence_manager
+                        .clear_sender_key_devices(&group_jid)
+                        .await
+                    {
+                        log::warn!("Failed to clear sender key devices for rotation: {}", e);
+                    }
+                    self.sender_key_device_cache.invalidate(&group_jid).await;
+                }
+            }
+
+            // Mark this device as needing fresh SKDM (filters out own devices internally)
             if let Err(e) = self
-                .mark_forget_sender_key(&group_jid, std::slice::from_ref(&participant_str))
+                .mark_forget_sender_key(&group_jid, std::slice::from_ref(&participant_jid))
                 .await
             {
                 log::warn!(
                     "Failed to mark sender key forget for {} in {}: {}",
-                    participant_str,
+                    participant_jid,
                     group_jid,
                     e
                 );
@@ -242,7 +355,7 @@ impl Client {
                 };
                 info!(
                     "Marked {} for fresh SKDM in {} {} due to retry receipt",
-                    participant_str, chat_type, group_jid
+                    participant_jid, chat_type, group_jid
                 );
             }
         } else {
@@ -250,34 +363,42 @@ impl Client {
             // This detects when we haven't regenerated our session despite receiving retry receipts,
             // which can cause infinite retry loops where both sides are stuck with stale keys.
             let signal_address = participant_jid.to_protocol_address();
-            let address_str = signal_address.to_string();
             let device_store = self.persistence_manager.get_device_arc().await;
 
-            // Check for base key collision before deleting the session
+            // Check for base key collision before deleting the session.
+            // Read session through cache for consistent state.
             {
                 let device_guard = device_store.read().await;
-                if let Ok(session) = device_guard.load_session(&signal_address).await
+                let session = self
+                    .signal_cache
+                    .get_session(&signal_address, &*device_guard.backend)
+                    .await
+                    .ok()
+                    .flatten();
+
+                if let Some(session) = session
                     && let Ok(current_base_key) = session.alice_base_key()
                 {
+                    let addr_str = signal_address.as_str();
                     if retry_count == MIN_RETRY_FOR_BASE_KEY_CHECK {
                         // On retry 2: Save the base key for later comparison
                         if let Err(e) = device_guard
                             .backend
-                            .save_base_key(&address_str, &message_id, current_base_key)
+                            .save_base_key(addr_str, &message_id, current_base_key)
                             .await
                         {
-                            warn!("Failed to save base key for {}: {}", address_str, e);
+                            warn!("Failed to save base key for {}: {}", signal_address, e);
                         } else {
                             info!(
                                 "Saved base key for {} at retry #{} for collision detection",
-                                address_str, retry_count
+                                signal_address, retry_count
                             );
                         }
                     } else if retry_count > MIN_RETRY_FOR_BASE_KEY_CHECK {
                         // On retry > 2: Check if base key is the same (collision detection)
                         match device_guard
                             .backend
-                            .has_same_base_key(&address_str, &message_id, current_base_key)
+                            .has_same_base_key(addr_str, &message_id, current_base_key)
                             .await
                         {
                             Ok(true) => {
@@ -285,45 +406,52 @@ impl Client {
                                 warn!(
                                     "Base key collision detected for {} at retry #{}. \
                                      Session hasn't been regenerated. Forcing fresh session.",
-                                    address_str, retry_count
+                                    signal_address, retry_count
                                 );
                                 // Clean up base key entry since we're deleting the session
                                 let _ = device_guard
                                     .backend
-                                    .delete_base_key(&address_str, &message_id)
+                                    .delete_base_key(addr_str, &message_id)
                                     .await;
                             }
                             Ok(false) => {
                                 // Base key changed, session was regenerated - good!
                                 info!(
                                     "Base key changed for {} at retry #{} - session regenerated",
-                                    address_str, retry_count
+                                    signal_address, retry_count
                                 );
                                 // Clean up old base key entry
                                 let _ = device_guard
                                     .backend
-                                    .delete_base_key(&address_str, &message_id)
+                                    .delete_base_key(addr_str, &message_id)
                                     .await;
                             }
                             Err(e) => {
-                                warn!("Failed to check base key for {}: {}", address_str, e);
+                                warn!("Failed to check base key for {}: {}", signal_address, e);
                             }
                         }
                     }
                 }
             }
 
-            // Delete the old session so a fresh one is established on resend.
-            if let Err(e) = device_store
-                .write()
-                .await
-                .delete_session(&signal_address)
-                .await
-            {
-                log::warn!("Failed to delete session for {signal_address}: {e}");
-            } else {
-                info!("Deleted session for {signal_address} due to retry receipt");
-            }
+            // Delete the old session through the signal cache so encryption uses a fresh session.
+            // IMPORTANT: Must go through cache, not backend, to avoid stale cached sessions.
+            self.signal_cache.delete_session(&signal_address).await;
+            self.flush_signal_cache().await.unwrap_or_else(|e| {
+                log::warn!("Failed to flush signal cache after session delete: {e}");
+            });
+            info!("Deleted session for {signal_address} due to retry receipt");
+        }
+
+        // Status broadcasts can't resend (requires explicit recipient list).
+        // Participant already marked for fresh SKDM above; next status send includes them.
+        if receipt.source.chat.is_status_broadcast() {
+            info!(
+                "Status broadcast retry for {} — participant marked for fresh SKDM, \
+                 will be included in next status send",
+                message_id
+            );
+            return Ok(());
         }
 
         info!(
@@ -331,16 +459,54 @@ impl Client {
             message_id, receipt.source.chat, retry_count
         );
 
-        self.send_message_impl(
-            receipt.source.chat.clone(),
-            &original_msg,
-            Some(message_id),
-            false,
-            true, // is_retry: includes fresh SKDM for groups
-            None,
-            vec![], // Extra nodes not preserved on retry - caller must resend with options if needed
-        )
-        .await?;
+        if receipt.source.chat.is_group() {
+            // Group retry: pairwise encrypt to failing device only (RetryMsgJob.js:71).
+            // Using sender-key broadcast would resend to ALL participants → duplicates.
+            let encryption_jid = self.resolve_encryption_jid(&participant_jid).await;
+            let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+
+            let addressing_mode = cached_group_info
+                .as_ref()
+                .map(|g| g.addressing_mode)
+                .unwrap_or_default();
+
+            let device_store_arc = self.persistence_manager.get_device_arc().await;
+            let mut store_adapter = crate::store::signal_adapter::SignalProtocolStoreAdapter::new(
+                device_store_arc,
+                self.signal_cache.clone(),
+            );
+
+            let stanza = wacore::send::prepare_group_retry_stanza(
+                &mut store_adapter.session_store,
+                &mut store_adapter.identity_store,
+                receipt.source.chat.clone(),
+                participant_jid,
+                encryption_jid,
+                &original_msg,
+                message_id,
+                retry_count,
+                device_snapshot.account.as_ref(),
+                addressing_mode,
+            )
+            .await?;
+
+            self.send_node(stanza).await?;
+            self.flush_signal_cache().await.unwrap_or_else(|e| {
+                log::warn!("Failed to flush signal cache after group retry: {e}");
+            });
+        } else {
+            // DM retry: re-encrypt via normal send path (already targets single recipient)
+            self.send_message_impl(
+                receipt.source.chat.clone(),
+                &original_msg,
+                Some(message_id),
+                false,
+                true,
+                None,
+                vec![],
+            )
+            .await?;
+        }
 
         Ok(())
     }
@@ -389,29 +555,39 @@ impl Client {
         let signal_address = requester_jid.to_protocol_address();
 
         // Check if the registration ID changed (indicates device reinstall).
-        let device_store = self.persistence_manager.get_device_arc().await;
-        let device_guard = device_store.read().await;
-        if let Ok(session) = device_guard.load_session(&signal_address).await {
-            let existing_reg_id = session.remote_registration_id()?;
-            if existing_reg_id != 0 && existing_reg_id != registration_id {
-                // WhatsApp Web throws an error for peer device registration ID changes.
-                // This is a security measure - peer devices should maintain consistent identity.
-                if is_peer {
-                    return Err(anyhow::anyhow!(
-                        "Registration ID changed for peer device {} (was {}, now {}). \
-                         This may indicate the device was reinstalled.",
-                        signal_address,
-                        existing_reg_id,
-                        registration_id
-                    ));
+        // Read session through cache for consistent state.
+        {
+            let device_store = self.persistence_manager.get_device_arc().await;
+            let device_guard = device_store.read().await;
+            let session = self
+                .signal_cache
+                .get_session(&signal_address, &*device_guard.backend)
+                .await
+                .ok()
+                .flatten();
+            drop(device_guard);
+
+            if let Some(session) = session {
+                let existing_reg_id = session.remote_registration_id()?;
+                if existing_reg_id != 0 && existing_reg_id != registration_id {
+                    // WhatsApp Web throws an error for peer device registration ID changes.
+                    // This is a security measure - peer devices should maintain consistent identity.
+                    if is_peer {
+                        return Err(anyhow::anyhow!(
+                            "Registration ID changed for peer device {} (was {}, now {}). \
+                             This may indicate the device was reinstalled.",
+                            signal_address,
+                            existing_reg_id,
+                            registration_id
+                        ));
+                    }
+                    info!(
+                        "Registration ID changed for {} (was {}, now {}). Session will be replaced.",
+                        signal_address, existing_reg_id, registration_id
+                    );
                 }
-                info!(
-                    "Registration ID changed for {} (was {}, now {}). Session will be replaced.",
-                    signal_address, existing_reg_id, registration_id
-                );
             }
         }
-        drop(device_guard);
 
         // Extract identity key.
         let identity_bytes = keys_node
@@ -456,20 +632,35 @@ impl Client {
             identity_key.into(),
         )?;
 
+        // Acquire per-sender session lock to prevent race with concurrent message decryption.
+        // This matches the session_locks pattern used in process_session_enc_batch.
+        let session_mutex = self
+            .session_locks
+            .get_with_by_ref(signal_address.as_str(), async {
+                std::sync::Arc::new(async_lock::Mutex::new(()))
+            })
+            .await;
+        let _session_guard = session_mutex.lock().await;
+
         let device_store = self.persistence_manager.get_device_arc().await;
 
-        let mut adapter =
-            crate::store::signal_adapter::SignalProtocolStoreAdapter::new(device_store);
+        let mut adapter = crate::store::signal_adapter::SignalProtocolStoreAdapter::new(
+            device_store,
+            self.signal_cache.clone(),
+        );
 
         process_prekey_bundle(
             &signal_address,
             &mut adapter.session_store,
             &mut adapter.identity_store,
             &bundle,
-            &mut rand::rngs::OsRng.unwrap_err(),
+            &mut rand::make_rng::<rand::rngs::StdRng>(),
             UsePQRatchet::No,
         )
         .await?;
+
+        // Flush after session establishment
+        self.flush_signal_cache().await?;
 
         info!(
             "Processed key bundle from retry receipt for {}",
@@ -542,17 +733,16 @@ impl Client {
         // WhatsApp Web only includes keys when retryCount >= 2.
         // First retry gives the sender a chance to resend without full key exchange.
         //
-        // Optimization: For NoSession errors (no sender key), include keys on retry#1.
-        // This reduces round-trips from 2 to 1 for skmsg-only message failures, since
-        // the sender needs our fresh prekeys to establish a session and send SKDM.
-        // This is a conservative optimization that only adds information to the retry.
+        // WA Web includes keys at retryCount >= MIN_RETRY_COUNT_FOR_KEYS.
+        // Optimization for NoSession: include keys on retry#1 to reduce round-trips
+        // for skmsg-only failures where the sender needs our prekeys for SKDM.
         let include_keys_early = reason == RetryReason::NoSession;
         let keys_node = if retry_count >= MIN_RETRY_COUNT_FOR_KEYS || include_keys_early {
             let device_store = self.persistence_manager.get_device_arc().await;
             let device_guard = device_store.read().await;
 
             let new_prekey_id = (rand::random::<u32>() % 16777215) + 1;
-            let new_prekey_keypair = KeyPair::generate(&mut rand::rngs::OsRng.unwrap_err());
+            let new_prekey_keypair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
             let new_prekey_record = wacore::libsignal::store::record_helpers::new_pre_key_record(
                 new_prekey_id,
                 &new_prekey_keypair,
@@ -611,21 +801,21 @@ impl Client {
         };
 
         let receipt_to = if info.source.is_group {
-            info.source.chat.to_string()
+            &info.source.chat
         } else {
-            info.source.sender.to_string()
+            &info.source.sender
         };
 
         // Build the receipt node. For group messages, include the participant attribute
         // to identify which group member should resend. For DMs, omit it since the
         // "to" address already identifies the sender.
         let mut builder = NodeBuilder::new("receipt")
-            .attr("to", receipt_to)
+            .attr("to", receipt_to.clone())
             .attr("id", info.id.clone())
             .attr("type", "retry");
 
         if info.source.is_group {
-            builder = builder.attr("participant", info.source.sender.to_string());
+            builder = builder.attr("participant", info.source.sender.clone());
         }
 
         // Handle peer vs device sync messages (matches WhatsApp Web's sendRetryReceipt):
@@ -643,13 +833,13 @@ impl Client {
                     .is_some_and(|lid| info.source.sender.is_same_user_as(lid));
 
             if is_from_own_account {
-                if info.category == "peer" {
-                    builder = builder.attr("category", "peer");
+                if info.category == MessageCategory::Peer {
+                    builder = builder.attr("category", MessageCategory::Peer.as_str());
                 } else {
                     // Include recipient so the sender can look up the original message.
                     // Without this, the retry fails silently (getTargetChat returns null).
                     let recipient = info.source.recipient.as_ref().unwrap_or(&info.source.chat);
-                    builder = builder.attr("recipient", recipient.to_string());
+                    builder = builder.attr("recipient", recipient.clone());
                 }
             }
         }
@@ -666,6 +856,55 @@ impl Client {
         self.send_node(receipt_node).await?;
         Ok(())
     }
+
+    /// Sends an `enc_rekey_retry` receipt for VoIP call encryption re-keying.
+    ///
+    /// WA Web: When a peer fails to decrypt VoIP call encryption data (e.g.,
+    /// `<enc>` within a `<call>` stanza), the receiver sends this receipt asking
+    /// the sender to re-key.  The receipt uses `<enc_rekey>` child instead of
+    /// `<retry>`, carrying VoIP call context (`call-id`, `call-creator`).
+    ///
+    /// WA Web reference: `ENC_RETRY_RECEIPT_ATTRS.GROUP_CALL = "enc_rekey_retry"`,
+    /// constructed in `WAWebVoipSignalingEnums` module.
+    #[allow(dead_code)] // Will be used when call handling is implemented (#345)
+    pub(crate) async fn send_enc_rekey_retry_receipt(
+        &self,
+        stanza_id: &str,
+        peer_jid: &wacore_binary::jid::Jid,
+        call_id: &str,
+        call_creator: &wacore_binary::jid::Jid,
+        retry_count: u8,
+    ) -> Result<(), anyhow::Error> {
+        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+
+        let registration_id_bytes = device_snapshot.registration_id.to_be_bytes().to_vec();
+
+        // WA Web: <enc_rekey call-creator="JID" call-id="..." count="N"/>
+        let enc_rekey_node = NodeBuilder::new("enc_rekey")
+            .attr("call-creator", call_creator.clone())
+            .attr("call-id", call_id)
+            .attr("count", retry_count.to_string())
+            .build();
+
+        let registration_node = NodeBuilder::new("registration")
+            .bytes(registration_id_bytes)
+            .build();
+
+        let receipt_node = NodeBuilder::new("receipt")
+            .attr("to", peer_jid.clone())
+            .attr("id", stanza_id)
+            .attr("type", "enc_rekey_retry")
+            .children([enc_rekey_node, registration_node])
+            .build();
+
+        info!(
+            "Sending enc_rekey_retry receipt for call-id={} to {} (count={})",
+            call_id, peer_jid, retry_count
+        );
+
+        self.send_node(receipt_node).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -673,6 +912,7 @@ mod tests {
     use super::*;
     use crate::store::persistence_manager::PersistenceManager;
     use crate::test_utils::MockHttpClient;
+    use std::borrow::Cow;
     use wacore_binary::jid::{Jid, JidExt};
     use waproto::whatsapp as wa;
 
@@ -686,11 +926,16 @@ mod tests {
                 .await
                 .expect("persistence manager should initialize"),
         );
-        let (client, _sync_rx) = Client::new(
+        // Enable L1 cache so MockBackend (which doesn't persist) works for this test
+        let mut config = crate::cache_config::CacheConfig::default();
+        config.recent_messages.capacity = 1_000;
+        let (client, _sync_rx) = Client::new_with_cache_config(
+            Arc::new(crate::runtime_impl::TokioRuntime),
             pm.clone(),
             Arc::new(crate::transport::mock::MockTransportFactory::new()),
             Arc::new(MockHttpClient),
             None,
+            config,
         )
         .await;
 
@@ -732,7 +977,7 @@ mod tests {
 
         // Test with bytes content
         let node = Node {
-            tag: "test".to_string(),
+            tag: Cow::Borrowed("test"),
             attrs: Attrs::new(),
             content: Some(NodeContent::Bytes(vec![1, 2, 3, 4])),
         };
@@ -740,7 +985,7 @@ mod tests {
 
         // Test with string content (should return None)
         let node_str = Node {
-            tag: "test".to_string(),
+            tag: Cow::Borrowed("test"),
             attrs: Attrs::new(),
             content: Some(NodeContent::String("hello".to_string())),
         };
@@ -748,7 +993,7 @@ mod tests {
 
         // Test with no content
         let node_empty = Node {
-            tag: "test".to_string(),
+            tag: Cow::Borrowed("test"),
             attrs: Attrs::new(),
             content: None,
         };
@@ -770,7 +1015,7 @@ mod tests {
     /// Matches WhatsApp Web's sendRetryReceipt: if (to.isUser()) { if (isMeAccount(to)) { ... } }
     #[test]
     fn retry_receipt_attributes_for_device_sync_vs_peer_vs_group() {
-        use wacore::types::message::{MessageInfo, MessageSource};
+        use wacore::types::message::{MessageCategory, MessageInfo, MessageSource};
         use wacore_binary::builder::NodeBuilder;
 
         let our_pn = Jid::pn("559999999999");
@@ -782,12 +1027,12 @@ mod tests {
             our_lid: &Jid,
         ) -> wacore_binary::node::Node {
             let mut builder = NodeBuilder::new("receipt")
-                .attr("to", info.source.sender.to_string())
+                .attr("to", info.source.sender.clone())
                 .attr("id", info.id.clone())
                 .attr("type", "retry");
 
             if info.source.is_group {
-                builder = builder.attr("participant", info.source.sender.to_string());
+                builder = builder.attr("participant", info.source.sender.clone());
             }
 
             if !info.source.is_group {
@@ -795,11 +1040,11 @@ mod tests {
                     || info.source.sender.is_same_user_as(our_lid);
 
                 if is_from_own_account {
-                    if info.category == "peer" {
-                        builder = builder.attr("category", "peer");
+                    if info.category == MessageCategory::Peer {
+                        builder = builder.attr("category", MessageCategory::Peer.as_str());
                     } else {
                         let recipient = info.source.recipient.as_ref().unwrap_or(&info.source.chat);
-                        builder = builder.attr("recipient", recipient.to_string());
+                        builder = builder.attr("recipient", recipient.clone());
                     }
                 }
             }
@@ -819,22 +1064,24 @@ mod tests {
                 recipient: Some(recipient_lid.clone()),
                 ..Default::default()
             },
-            category: String::new(),
+            category: MessageCategory::default(),
             ..Default::default()
         };
 
         let node = build_retry_receipt(&device_sync_info, &our_pn, &our_lid);
         assert_eq!(
-            node.attrs().optional_string("recipient"),
-            Some("200000000000002@lid"),
+            node.attrs
+                .get("recipient")
+                .map(|v| v == "200000000000002@lid"),
+            Some(true),
             "Device sync DM should include recipient"
         );
         assert!(
-            node.attrs().optional_string("category").is_none(),
+            node.attrs.get("category").is_none(),
             "Device sync DM should NOT have category=peer"
         );
         assert!(
-            node.attrs().optional_string("participant").is_none(),
+            node.attrs.get("participant").is_none(),
             "DM should NOT have participant"
         );
 
@@ -850,18 +1097,18 @@ mod tests {
                 recipient: None,
                 ..Default::default()
             },
-            category: "peer".to_string(),
+            category: MessageCategory::Peer,
             ..Default::default()
         };
 
         let node = build_retry_receipt(&peer_info, &our_pn, &our_lid);
         assert_eq!(
-            node.attrs().optional_string("category"),
-            Some("peer"),
+            node.attrs.get("category").map(|v| v == "peer"),
+            Some(true),
             "Peer DM should have category=peer"
         );
         assert!(
-            node.attrs().optional_string("recipient").is_none(),
+            node.attrs.get("recipient").is_none(),
             "Peer DM should NOT have recipient"
         );
 
@@ -876,21 +1123,21 @@ mod tests {
                 recipient: None,
                 ..Default::default()
             },
-            category: String::new(),
+            category: MessageCategory::default(),
             ..Default::default()
         };
 
         let node = build_retry_receipt(&group_info, &our_pn, &our_lid);
         assert!(
-            node.attrs().optional_string("participant").is_some(),
+            node.attrs.get("participant").is_some(),
             "Group should have participant"
         );
         assert!(
-            node.attrs().optional_string("category").is_none(),
+            node.attrs.get("category").is_none(),
             "Group should NOT have category"
         );
         assert!(
-            node.attrs().optional_string("recipient").is_none(),
+            node.attrs.get("recipient").is_none(),
             "Group should NOT have recipient"
         );
 
@@ -905,18 +1152,109 @@ mod tests {
                 recipient: None,
                 ..Default::default()
             },
-            category: String::new(),
+            category: MessageCategory::default(),
             ..Default::default()
         };
 
         let node = build_retry_receipt(&other_dm_info, &our_pn, &our_lid);
         assert!(
-            node.attrs().optional_string("category").is_none(),
+            node.attrs.get("category").is_none(),
             "DM from other should NOT have category"
         );
         assert!(
-            node.attrs().optional_string("recipient").is_none(),
+            node.attrs.get("recipient").is_none(),
             "DM from other should NOT have recipient"
+        );
+    }
+
+    /// Verify enc_rekey_retry receipt node structure matches WhatsApp Web:
+    /// <receipt to="peer" id="stanza_id" type="enc_rekey_retry">
+    ///   <enc_rekey call-creator="creator_jid" call-id="..." count="N"/>
+    ///   <registration>{4-byte big-endian reg id}</registration>
+    /// </receipt>
+    #[test]
+    fn enc_rekey_retry_receipt_node_structure() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let peer_jid: Jid = "5511999999999@s.whatsapp.net".parse().expect("peer JID");
+        let call_creator: Jid = "5511888888888@s.whatsapp.net".parse().expect("creator JID");
+        let call_id = "CALL-ABC-123";
+        let stanza_id = "3EB0AABBCCDD";
+        let retry_count: u8 = 2;
+        let registration_id: u32 = 12345;
+
+        // Build the receipt exactly as send_enc_rekey_retry_receipt does
+        let enc_rekey_node = NodeBuilder::new("enc_rekey")
+            .attr("call-creator", call_creator)
+            .attr("call-id", call_id)
+            .attr("count", retry_count.to_string())
+            .build();
+
+        let registration_node = NodeBuilder::new("registration")
+            .bytes(registration_id.to_be_bytes().to_vec())
+            .build();
+
+        let receipt_node = NodeBuilder::new("receipt")
+            .attr("to", peer_jid)
+            .attr("id", stanza_id)
+            .attr("type", "enc_rekey_retry")
+            .children([enc_rekey_node, registration_node])
+            .build();
+
+        // Verify top-level receipt attributes
+        assert_eq!(
+            receipt_node.attrs().optional_string("type").as_deref(),
+            Some("enc_rekey_retry"),
+            "receipt type must be enc_rekey_retry"
+        );
+        assert!(
+            receipt_node
+                .attrs
+                .get("to")
+                .is_some_and(|v| *v == "5511999999999@s.whatsapp.net"),
+            "receipt 'to' must be peer JID"
+        );
+        assert_eq!(
+            receipt_node.attrs().optional_string("id").as_deref(),
+            Some("3EB0AABBCCDD")
+        );
+
+        // Verify <enc_rekey> child (NOT <retry>)
+        assert!(
+            receipt_node.get_optional_child("retry").is_none(),
+            "enc_rekey_retry must NOT contain <retry> child"
+        );
+        let enc_rekey = receipt_node
+            .get_optional_child("enc_rekey")
+            .expect("<enc_rekey> child must exist");
+        assert_eq!(
+            enc_rekey.attrs().optional_string("call-id").as_deref(),
+            Some("CALL-ABC-123")
+        );
+        assert!(
+            enc_rekey
+                .attrs
+                .get("call-creator")
+                .is_some_and(|v| *v == "5511888888888@s.whatsapp.net"),
+            "enc_rekey 'call-creator' must be creator JID"
+        );
+        assert_eq!(
+            enc_rekey.attrs().optional_string("count").as_deref(),
+            Some("2")
+        );
+
+        // Verify <registration> child
+        let registration = receipt_node
+            .get_optional_child("registration")
+            .expect("<registration> child must exist");
+        let reg_bytes = match &registration.content {
+            Some(wacore_binary::node::NodeContent::Bytes(b)) => b.clone(),
+            _ => panic!("registration must contain bytes"),
+        };
+        assert_eq!(
+            u32::from_be_bytes(reg_bytes.try_into().unwrap()),
+            12345,
+            "registration ID must be 4-byte big-endian"
         );
     }
 
@@ -1120,12 +1458,12 @@ mod tests {
         // Test with 4-byte registration ID
         let reg_bytes = vec![0x00, 0x01, 0x02, 0x03]; // = 66051
         let reg_node = Node {
-            tag: "registration".to_string(),
+            tag: Cow::Borrowed("registration"),
             attrs: Attrs::new(),
             content: Some(NodeContent::Bytes(reg_bytes)),
         };
         let parent = Node {
-            tag: "receipt".to_string(),
+            tag: Cow::Borrowed("receipt"),
             attrs: Attrs::new(),
             content: Some(NodeContent::Nodes(vec![reg_node])),
         };
@@ -1134,12 +1472,12 @@ mod tests {
         // Test with 3-byte registration ID (variable length)
         let reg_bytes_short = vec![0x01, 0x02, 0x03]; // = 66051
         let reg_node_short = Node {
-            tag: "registration".to_string(),
+            tag: Cow::Borrowed("registration"),
             attrs: Attrs::new(),
             content: Some(NodeContent::Bytes(reg_bytes_short)),
         };
         let parent_short = Node {
-            tag: "receipt".to_string(),
+            tag: Cow::Borrowed("receipt"),
             attrs: Attrs::new(),
             content: Some(NodeContent::Nodes(vec![reg_node_short])),
         };
@@ -1150,7 +1488,7 @@ mod tests {
 
         // Test with no registration node
         let parent_no_reg = Node {
-            tag: "receipt".to_string(),
+            tag: Cow::Borrowed("receipt"),
             attrs: Attrs::new(),
             content: Some(NodeContent::Nodes(vec![])),
         };
@@ -1158,12 +1496,12 @@ mod tests {
 
         // Test with empty bytes
         let reg_node_empty = Node {
-            tag: "registration".to_string(),
+            tag: Cow::Borrowed("registration"),
             attrs: Attrs::new(),
             content: Some(NodeContent::Bytes(vec![])),
         };
         let parent_empty = Node {
-            tag: "receipt".to_string(),
+            tag: Cow::Borrowed("receipt"),
             attrs: Attrs::new(),
             content: Some(NodeContent::Nodes(vec![reg_node_empty])),
         };
@@ -1389,5 +1727,161 @@ mod tests {
         // - Before: retry#1 (no keys) → sender can't establish session → retry#2 (keys) → device removed
         // - After: retry#1 (keys) → sender can establish session immediately → device removed before response
         // The optimization gives the sender one fewer round-trip to respond.
+    }
+
+    /// Test that participant extraction from receipt nodes works correctly
+    /// for status broadcasts. The `participant` attribute contains the actual
+    /// retrying device, while `receipt.source.sender` may be `status@broadcast`.
+    #[test]
+    fn status_broadcast_participant_extraction() {
+        use wacore_binary::builder::NodeBuilder;
+
+        // Simulate a retry receipt for a status broadcast with participant attribute
+        let node = NodeBuilder::new("receipt")
+            .attr("from", "status@broadcast")
+            .attr("id", "3EB06D00CAB92340790621")
+            .attr("participant", "236395184570386@lid")
+            .attr("type", "retry")
+            .build();
+
+        let is_group_or_status = true;
+        let fallback_sender: Jid = "status@broadcast".parse().unwrap();
+
+        let participant_str = if is_group_or_status {
+            node.attrs()
+                .optional_string("participant")
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| fallback_sender.to_string())
+        } else {
+            fallback_sender.to_string()
+        };
+
+        // Should extract the actual participant, not status@broadcast
+        assert_eq!(participant_str, "236395184570386@lid");
+
+        let participant_jid: Jid = participant_str.parse().unwrap();
+        assert!(participant_jid.is_lid());
+        assert_eq!(participant_jid.user, "236395184570386");
+        assert!(!participant_jid.is_status_broadcast());
+    }
+
+    /// Test fallback when participant attribute is missing from status receipt.
+    #[test]
+    fn status_broadcast_participant_extraction_fallback() {
+        use wacore_binary::builder::NodeBuilder;
+
+        // Receipt without participant attribute (edge case)
+        let node = NodeBuilder::new("receipt")
+            .attr("from", "status@broadcast")
+            .attr("id", "MSG001")
+            .attr("type", "retry")
+            .build();
+
+        let fallback_sender: Jid = "status@broadcast".parse().unwrap();
+
+        let participant_str = node
+            .attrs()
+            .optional_string("participant")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| fallback_sender.to_string());
+
+        // Falls back to sender (status@broadcast) — not ideal but won't crash
+        assert_eq!(participant_str, "status@broadcast");
+    }
+
+    /// Test that dedupe keys are correctly differentiated per-participant
+    /// for status broadcast retries.
+    #[test]
+    fn status_broadcast_dedupe_key_per_participant() {
+        let chat = "status@broadcast";
+        let msg_id = "3EB06D00CAB92340790621";
+
+        let key_a = format!("{}:{}:{}", chat, msg_id, "236395184570386@lid");
+        let key_b = format!("{}:{}:{}", chat, msg_id, "559985213786@s.whatsapp.net");
+
+        assert_ne!(
+            key_a, key_b,
+            "Different participants should have different dedupe keys"
+        );
+
+        let key_a2 = format!("{}:{}:{}", chat, msg_id, "236395184570386@lid");
+        assert_eq!(
+            key_a, key_a2,
+            "Same participant should have same dedupe key"
+        );
+    }
+
+    /// Test that the recent message cache supports re-addition after take.
+    /// This is critical for status broadcasts where we take the message,
+    /// mark the participant for fresh SKDM, then re-add so other devices
+    /// can also retry.
+    #[tokio::test]
+    async fn recent_message_cache_readd_after_take() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let backend = crate::test_utils::create_test_backend().await;
+        let pm = Arc::new(
+            PersistenceManager::new(backend)
+                .await
+                .expect("persistence manager should initialize"),
+        );
+        // Enable L1 cache so MockBackend (which doesn't persist) works for this test
+        let mut config = crate::cache_config::CacheConfig::default();
+        config.recent_messages.capacity = 1_000;
+        let (client, _sync_rx) = Client::new_with_cache_config(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm.clone(),
+            Arc::new(crate::transport::mock::MockTransportFactory::new()),
+            Arc::new(MockHttpClient),
+            None,
+            config,
+        )
+        .await;
+
+        let chat = Jid::status_broadcast();
+        let msg_id = "STATUS_MSG_001".to_string();
+        let msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("status text".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        // Add message to cache
+        client
+            .add_recent_message(chat.clone(), msg_id.clone(), &msg)
+            .await;
+
+        // First device takes the message
+        let taken = client
+            .take_recent_message(chat.clone(), msg_id.clone())
+            .await;
+        assert!(taken.is_some(), "First take should succeed");
+
+        // Re-add for subsequent retries (simulating the status broadcast fix)
+        let taken_msg = taken.unwrap();
+        client
+            .add_recent_message(chat.clone(), msg_id.clone(), &taken_msg)
+            .await;
+
+        // Second device should also be able to take the message
+        let taken2 = client
+            .take_recent_message(chat.clone(), msg_id.clone())
+            .await;
+        assert!(
+            taken2.is_some(),
+            "Second take should succeed after re-add (status broadcast multi-device retry)"
+        );
+        assert_eq!(
+            taken2
+                .unwrap()
+                .extended_text_message
+                .as_ref()
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("status text")
+        );
     }
 }

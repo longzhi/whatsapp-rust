@@ -4,6 +4,7 @@ use crate::iq::spec::IqSpec;
 use crate::protocol::ProtocolNode;
 use crate::request::InfoQuery;
 use anyhow::{Result, anyhow};
+use std::num::NonZeroU32;
 use typed_builder::TypedBuilder;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::jid::{GROUP_SERVER, Jid};
@@ -156,6 +157,21 @@ pub struct GroupCreateOptions {
     pub membership_approval_mode: Option<MembershipApprovalMode>,
     #[builder(default = Some(0), setter(strip_option))]
     pub ephemeral_expiration: Option<u32>,
+    /// Create as a community (parent group). Emits `<parent/>` in the create stanza.
+    #[builder(default)]
+    pub is_parent: bool,
+    /// Whether the community is closed (requires approval to join).
+    /// Only used when `is_parent` is true.
+    #[builder(default)]
+    pub closed: bool,
+    /// Allow non-admin members to create subgroups.
+    /// Only used when `is_parent` is true.
+    #[builder(default)]
+    pub allow_non_admin_sub_group_creation: bool,
+    /// Create a general chat subgroup alongside the community.
+    /// Only used when `is_parent` is true.
+    #[builder(default)]
+    pub create_general_chat: bool,
 }
 
 impl GroupCreateOptions {
@@ -207,6 +223,10 @@ impl Default for GroupCreateOptions {
             member_add_mode: Some(MemberAddMode::AllMemberAdd),
             membership_approval_mode: Some(MembershipApprovalMode::Off),
             ephemeral_expiration: Some(0),
+            is_parent: false,
+            closed: false,
+            allow_non_admin_sub_group_creation: false,
+            create_general_chat: false,
         }
     }
 }
@@ -291,34 +311,36 @@ pub fn build_create_group_node(options: &GroupCreateOptions) -> Node {
         );
     }
 
+    // Community (parent group) fields
+    if options.is_parent {
+        let mut parent_builder = NodeBuilder::new("parent");
+        if options.closed {
+            parent_builder =
+                parent_builder.attr("default_membership_approval_mode", "request_required");
+        }
+        children.push(parent_builder.build());
+
+        if options.allow_non_admin_sub_group_creation {
+            children.push(NodeBuilder::new("allow_non_admin_sub_group_creation").build());
+        }
+        if options.create_general_chat {
+            children.push(NodeBuilder::new("create_general_chat").build());
+        }
+    }
+
     NodeBuilder::new("create")
         .attr("subject", &options.subject)
         .children(children)
         .build()
 }
 /// Request to query group information.
-#[derive(Debug, Clone, Default)]
+///
+/// Wire format: `<query request="interactive"/>`
+#[derive(Debug, Clone, crate::ProtocolNode)]
+#[protocol(tag = "query")]
 pub struct GroupQueryRequest {
+    #[attr(name = "request", string_enum)]
     pub request: GroupQueryRequestType,
-}
-
-impl ProtocolNode for GroupQueryRequest {
-    fn tag(&self) -> &'static str {
-        "query"
-    }
-
-    fn into_node(self) -> Node {
-        NodeBuilder::new("query")
-            .attr("request", self.request.as_str())
-            .build()
-    }
-
-    fn try_from_node(node: &Node) -> Result<Self> {
-        if node.tag != "query" {
-            return Err(anyhow!("expected <query>, got <{}>", node.tag));
-        }
-        Ok(Self::default())
-    }
 }
 
 /// A participant in a group response.
@@ -335,9 +357,9 @@ impl ProtocolNode for GroupParticipantResponse {
     }
 
     fn into_node(self) -> Node {
-        let mut builder = NodeBuilder::new("participant").attr("jid", self.jid.to_string());
-        if let Some(pn) = &self.phone_number {
-            builder = builder.attr("phone_number", pn.to_string());
+        let mut builder = NodeBuilder::new("participant").attr("jid", self.jid);
+        if let Some(pn) = self.phone_number {
+            builder = builder.attr("phone_number", pn);
         }
         if self.participant_type != ParticipantType::Member {
             builder = builder.attr("type", self.participant_type.as_str());
@@ -355,7 +377,10 @@ impl ProtocolNode for GroupParticipantResponse {
             .ok_or_else(|| anyhow!("participant missing required 'jid' attribute"))?;
         let phone_number = node.attrs().optional_jid("phone_number");
         // Default to Member for unknown participant types to avoid failing the whole group parse
-        let participant_type = ParticipantType::try_from(node.attrs().optional_string("type"))
+        let participant_type = node
+            .attrs()
+            .optional_string("type")
+            .and_then(|s| ParticipantType::try_from(s.as_ref()).ok())
             .unwrap_or(ParticipantType::Member);
 
         Ok(Self {
@@ -373,6 +398,42 @@ pub struct GroupInfoResponse {
     pub subject: GroupSubject,
     pub addressing_mode: AddressingMode,
     pub participants: Vec<GroupParticipantResponse>,
+    /// Group creator JID (from `creator` attribute).
+    pub creator: Option<Jid>,
+    /// Group creation timestamp (from `creation` attribute).
+    pub creation_time: Option<u64>,
+    /// Subject modification timestamp (from `s_t` attribute).
+    pub subject_time: Option<u64>,
+    /// Subject owner JID (from `s_o` attribute).
+    pub subject_owner: Option<Jid>,
+    /// Group description body text.
+    pub description: Option<String>,
+    /// Description ID (for conflict detection when updating).
+    pub description_id: Option<String>,
+    /// Whether the group is locked (only admins can edit group info).
+    pub is_locked: bool,
+    /// Whether announcement mode is enabled (only admins can send messages).
+    pub is_announcement: bool,
+    /// Ephemeral message expiration in seconds (0 = disabled).
+    pub ephemeral_expiration: u32,
+    /// Whether membership approval is required to join.
+    pub membership_approval: bool,
+    /// Who can add members to the group.
+    pub member_add_mode: Option<MemberAddMode>,
+    /// Who can use invite links.
+    pub member_link_mode: Option<MemberLinkMode>,
+    /// Total participant count (from `size` attribute, useful for large groups).
+    pub size: Option<u32>,
+    /// Whether this group is a community parent group (has `<parent>` child).
+    pub is_parent_group: bool,
+    /// JID of the parent community (for subgroups, from `<linked_parent jid="..."/>`).
+    pub parent_group_jid: Option<Jid>,
+    /// Whether this is the default announcement subgroup of a community.
+    pub is_default_sub_group: bool,
+    /// Whether this is the general chat subgroup of a community.
+    pub is_general_chat: bool,
+    /// Whether non-admin community members can create subgroups.
+    pub allow_non_admin_sub_group_creation: bool,
 }
 
 impl ProtocolNode for GroupInfoResponse {
@@ -381,17 +442,99 @@ impl ProtocolNode for GroupInfoResponse {
     }
 
     fn into_node(self) -> Node {
-        let children: Vec<Node> = self
+        let mut children: Vec<Node> = self
             .participants
             .into_iter()
             .map(|p| p.into_node())
             .collect();
-        NodeBuilder::new("group")
-            .attr("id", self.id.to_string())
+
+        if self.is_locked {
+            children.push(NodeBuilder::new("locked").build());
+        }
+        if self.is_announcement {
+            children.push(NodeBuilder::new("announcement").build());
+        }
+        if self.ephemeral_expiration > 0 {
+            children.push(
+                NodeBuilder::new("ephemeral")
+                    .attr("expiration", self.ephemeral_expiration.to_string())
+                    .build(),
+            );
+        }
+        if self.membership_approval {
+            children.push(
+                NodeBuilder::new("membership_approval_mode")
+                    .children(vec![
+                        NodeBuilder::new("group_join").attr("state", "on").build(),
+                    ])
+                    .build(),
+            );
+        }
+        if let Some(ref add_mode) = self.member_add_mode {
+            children.push(
+                NodeBuilder::new("member_add_mode")
+                    .string_content(add_mode.as_str())
+                    .build(),
+            );
+        }
+        if let Some(ref link_mode) = self.member_link_mode {
+            children.push(
+                NodeBuilder::new("member_link_mode")
+                    .string_content(link_mode.as_str())
+                    .build(),
+            );
+        }
+        if let Some(ref desc) = self.description {
+            let mut desc_builder = NodeBuilder::new("description");
+            if let Some(ref desc_id) = self.description_id {
+                desc_builder = desc_builder.attr("id", desc_id.as_str());
+            }
+            children.push(desc_builder.string_content(desc.as_str()).build());
+        }
+
+        // Community fields
+        if self.is_parent_group {
+            children.push(NodeBuilder::new("parent").build());
+        }
+        if let Some(ref parent_jid) = self.parent_group_jid {
+            children.push(
+                NodeBuilder::new("linked_parent")
+                    .attr("jid", parent_jid.clone())
+                    .build(),
+            );
+        }
+        if self.is_default_sub_group {
+            children.push(NodeBuilder::new("default_sub_group").build());
+        }
+        if self.is_general_chat {
+            children.push(NodeBuilder::new("general_chat").build());
+        }
+        if self.allow_non_admin_sub_group_creation {
+            children.push(NodeBuilder::new("allow_non_admin_sub_group_creation").build());
+        }
+
+        let mut builder = NodeBuilder::new("group")
+            .attr("id", self.id)
             .attr("subject", self.subject.as_str())
-            .attr("addressing_mode", self.addressing_mode.as_str())
-            .children(children)
-            .build()
+            .attr("addressing_mode", self.addressing_mode.as_str());
+
+        if let Some(creator) = self.creator {
+            builder = builder.attr("creator", creator);
+        }
+        if let Some(creation_time) = self.creation_time {
+            builder = builder.attr("creation", creation_time.to_string());
+        }
+        if let Some(subject_time) = self.subject_time {
+            builder = builder.attr("s_t", subject_time.to_string());
+        }
+        if let Some(subject_owner) = self.subject_owner {
+            builder = builder.attr("s_o", subject_owner);
+        }
+        if let Some(size) = self.size {
+            builder = builder.attr("size", size.to_string());
+        }
+
+        builder.children(children).build()
     }
 
     fn try_from_node(node: &Node) -> Result<Self> {
@@ -406,19 +549,117 @@ impl ProtocolNode for GroupInfoResponse {
             Jid::group(id_str)
         };
 
-        let subject =
-            GroupSubject::new_unchecked(optional_attr(node, "subject").unwrap_or_default());
+        let subject = GroupSubject::new_unchecked(
+            optional_attr(node, "subject")
+                .as_deref()
+                .unwrap_or_default(),
+        );
 
-        let addressing_mode =
-            AddressingMode::try_from(optional_attr(node, "addressing_mode").unwrap_or("pn"))?;
+        let addressing_mode = AddressingMode::try_from(
+            optional_attr(node, "addressing_mode")
+                .as_deref()
+                .unwrap_or("pn"),
+        )?;
 
         let participants = collect_children::<GroupParticipantResponse>(node, "participant")?;
+
+        // Parse attributes
+        let creator = node
+            .attrs()
+            .optional_string("creator")
+            .and_then(|s| s.parse::<Jid>().ok());
+        let creation_time = node
+            .attrs()
+            .optional_string("creation")
+            .and_then(|s| s.parse::<u64>().ok());
+        let subject_time = node
+            .attrs()
+            .optional_string("s_t")
+            .and_then(|s| s.parse::<u64>().ok());
+        let subject_owner = node
+            .attrs()
+            .optional_string("s_o")
+            .and_then(|s| s.parse::<Jid>().ok());
+        let size = node
+            .attrs()
+            .optional_string("size")
+            .and_then(|s| s.parse::<u32>().ok());
+
+        // Parse settings from child nodes
+        let is_locked = node.get_optional_child_by_tag(&["locked"]).is_some();
+        let is_announcement = node.get_optional_child_by_tag(&["announcement"]).is_some();
+
+        let ephemeral_expiration = node
+            .get_optional_child_by_tag(&["ephemeral"])
+            .and_then(|n| n.attrs().optional_string("expiration"))
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+
+        let membership_approval = node
+            .get_optional_child_by_tag(&["membership_approval_mode", "group_join"])
+            .and_then(|n| n.attrs().optional_string("state"))
+            .is_some_and(|s| s == "on");
+
+        let member_add_mode = node
+            .get_optional_child_by_tag(&["member_add_mode"])
+            .and_then(|n| match &n.content {
+                Some(NodeContent::String(s)) => MemberAddMode::try_from(s.as_str()).ok(),
+                _ => None,
+            });
+
+        let member_link_mode = node
+            .get_optional_child_by_tag(&["member_link_mode"])
+            .and_then(|n| match &n.content {
+                Some(NodeContent::String(s)) => MemberLinkMode::try_from(s.as_str()).ok(),
+                _ => None,
+            });
+
+        // Parse description
+        let description_node = node.get_optional_child_by_tag(&["description"]);
+        let description = description_node.and_then(|n| match &n.content {
+            Some(NodeContent::String(s)) => Some(s.clone()),
+            _ => None,
+        });
+        let description_id = description_node
+            .and_then(|n| n.attrs().optional_string("id"))
+            .map(|s| s.to_string());
+
+        // Parse community fields
+        let is_parent_group = node.get_optional_child_by_tag(&["parent"]).is_some();
+        let parent_group_jid = node
+            .get_optional_child_by_tag(&["linked_parent"])
+            .and_then(|n| n.attrs().optional_jid("jid"));
+        let is_default_sub_group = node
+            .get_optional_child_by_tag(&["default_sub_group"])
+            .is_some();
+        let is_general_chat = node.get_optional_child_by_tag(&["general_chat"]).is_some();
+        let allow_non_admin_sub_group_creation = node
+            .get_optional_child_by_tag(&["allow_non_admin_sub_group_creation"])
+            .is_some();
 
         Ok(Self {
             id,
             subject,
             addressing_mode,
             participants,
+            creator,
+            creation_time,
+            subject_time,
+            subject_owner,
+            description,
+            description_id,
+            is_locked,
+            is_announcement,
+            ephemeral_expiration,
+            membership_approval,
+            member_add_mode,
+            member_link_mode,
+            size,
+            is_parent_group,
+            parent_group_jid,
+            is_default_sub_group,
+            is_general_chat,
+            allow_non_admin_sub_group_creation,
         })
     }
 }
@@ -598,42 +839,18 @@ impl IqSpec for GroupCreateIq {
 // ---------------------------------------------------------------------------
 
 /// Response for participant change operations (add/remove/promote/demote).
-#[derive(Debug, Clone)]
+///
+/// Wire format: `<participant jid="..." type="200" error="..."/>`
+#[derive(Debug, Clone, crate::ProtocolNode)]
+#[protocol(tag = "participant")]
 pub struct ParticipantChangeResponse {
+    #[attr(name = "jid", jid)]
     pub jid: Jid,
     /// HTTP-like status code (e.g. 200, 403, 409).
+    #[attr(name = "type")]
     pub status: Option<String>,
+    #[attr(name = "error")]
     pub error: Option<String>,
-}
-
-impl ProtocolNode for ParticipantChangeResponse {
-    fn tag(&self) -> &'static str {
-        "participant"
-    }
-
-    fn into_node(self) -> Node {
-        let mut builder = NodeBuilder::new("participant").attr("jid", self.jid.to_string());
-        if let Some(ref status) = self.status {
-            builder = builder.attr("type", status);
-        }
-        if let Some(ref error) = self.error {
-            builder = builder.attr("error", error);
-        }
-        builder.build()
-    }
-
-    fn try_from_node(node: &Node) -> Result<Self> {
-        if node.tag != "participant" {
-            return Err(anyhow!("expected <participant>, got <{}>", node.tag));
-        }
-        let jid = node
-            .attrs()
-            .optional_jid("jid")
-            .ok_or_else(|| anyhow!("participant missing required 'jid' attribute"))?;
-        let status = optional_attr(node, "type").map(String::from);
-        let error = optional_attr(node, "error").map(String::from);
-        Ok(Self { jid, status, error })
-    }
 }
 
 /// IQ specification for setting a group's subject.
@@ -707,8 +924,11 @@ impl SetGroupDescriptionIq {
         description: Option<GroupDescription>,
         prev: Option<String>,
     ) -> Self {
-        use rand::Rng;
-        let id = format!("{:08X}", rand::rng().random::<u32>());
+        use rand::RngExt;
+        let id = format!(
+            "{:08X}",
+            rand::make_rng::<rand::rngs::StdRng>().random::<u32>()
+        );
         Self {
             group_jid: group_jid.clone(),
             description,
@@ -780,7 +1000,7 @@ impl IqSpec for LeaveGroupIq {
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let group_node = NodeBuilder::new("group")
-            .attr("id", self.group_jid.to_string())
+            .attr("id", self.group_jid.clone())
             .build();
         let leave_node = NodeBuilder::new("leave").children([group_node]).build();
 
@@ -796,27 +1016,133 @@ impl IqSpec for LeaveGroupIq {
     }
 }
 
-/// IQ specification for adding participants to a group.
-///
-/// Wire format:
-/// ```xml
-/// <iq type="set" xmlns="w:g2" to="{group_jid}">
-///   <add>
-///     <participant jid="{user_jid}"/>
-///   </add>
-/// </iq>
-/// ```
+/// Macro to generate group participant IQ specs that share the same structure:
+/// a `set` IQ to `{group_jid}` with `<{action}><participant jid="..."/>...</{action}>`.
+macro_rules! define_group_participant_iq {
+    (
+        $(#[$meta:meta])*
+        $name:ident, action = $action:literal, response = Vec<ParticipantChangeResponse>
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone)]
+        pub struct $name {
+            pub group_jid: Jid,
+            pub participants: Vec<Jid>,
+        }
+
+        impl $name {
+            pub fn new(group_jid: &Jid, participants: &[Jid]) -> Self {
+                Self {
+                    group_jid: group_jid.clone(),
+                    participants: participants.to_vec(),
+                }
+            }
+        }
+
+        impl IqSpec for $name {
+            type Response = Vec<ParticipantChangeResponse>;
+
+            fn build_iq(&self) -> InfoQuery<'static> {
+                let children: Vec<Node> = self
+                    .participants
+                    .iter()
+                    .map(|jid| {
+                        NodeBuilder::new("participant")
+                            .attr("jid", jid.clone())
+                            .build()
+                    })
+                    .collect();
+
+                let action_node = NodeBuilder::new($action).children(children).build();
+
+                InfoQuery::set_ref(
+                    GROUP_IQ_NAMESPACE,
+                    &self.group_jid,
+                    Some(NodeContent::Nodes(vec![action_node])),
+                )
+            }
+
+            fn parse_response(&self, response: &Node) -> Result<Self::Response> {
+                let action_node = required_child(response, $action)?;
+                collect_children::<ParticipantChangeResponse>(action_node, "participant")
+            }
+        }
+    };
+    (
+        $(#[$meta:meta])*
+        $name:ident, action = $action:literal, response = ()
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone)]
+        pub struct $name {
+            pub group_jid: Jid,
+            pub participants: Vec<Jid>,
+        }
+
+        impl $name {
+            pub fn new(group_jid: &Jid, participants: &[Jid]) -> Self {
+                Self {
+                    group_jid: group_jid.clone(),
+                    participants: participants.to_vec(),
+                }
+            }
+        }
+
+        impl IqSpec for $name {
+            type Response = ();
+
+            fn build_iq(&self) -> InfoQuery<'static> {
+                let children: Vec<Node> = self
+                    .participants
+                    .iter()
+                    .map(|jid| {
+                        NodeBuilder::new("participant")
+                            .attr("jid", jid.clone())
+                            .build()
+                    })
+                    .collect();
+
+                let action_node = NodeBuilder::new($action).children(children).build();
+
+                InfoQuery::set_ref(
+                    GROUP_IQ_NAMESPACE,
+                    &self.group_jid,
+                    Some(NodeContent::Nodes(vec![action_node])),
+                )
+            }
+
+            fn parse_response(&self, _response: &Node) -> Result<Self::Response> {
+                Ok(())
+            }
+        }
+    };
+}
+
+/// IQ specification for adding participants to a group, with optional
+/// per-participant privacy tokens.
 #[derive(Debug, Clone)]
 pub struct AddParticipantsIq {
     pub group_jid: Jid,
-    pub participants: Vec<Jid>,
+    pub participants: Vec<GroupParticipantOptions>,
 }
 
 impl AddParticipantsIq {
+    /// Create from plain JIDs (no privacy tokens). Backwards compatible.
     pub fn new(group_jid: &Jid, participants: &[Jid]) -> Self {
         Self {
             group_jid: group_jid.clone(),
-            participants: participants.to_vec(),
+            participants: participants
+                .iter()
+                .map(|jid| GroupParticipantOptions::new(jid.clone()))
+                .collect(),
+        }
+    }
+
+    /// Create with full participant options (JID + optional phone_number + optional privacy token).
+    pub fn with_options(group_jid: &Jid, participants: Vec<GroupParticipantOptions>) -> Self {
+        Self {
+            group_jid: group_jid.clone(),
+            participants,
         }
     }
 }
@@ -828,187 +1154,77 @@ impl IqSpec for AddParticipantsIq {
         let children: Vec<Node> = self
             .participants
             .iter()
-            .map(|jid| {
-                NodeBuilder::new("participant")
-                    .attr("jid", jid.to_string())
-                    .build()
+            .map(|p| {
+                let mut attrs = vec![("jid", p.jid.to_string())];
+                // phone_number is only meaningful for LID JIDs
+                if p.jid.is_lid()
+                    && let Some(pn) = &p.phone_number
+                {
+                    attrs.push(("phone_number", pn.to_string()));
+                }
+                if let Some(privacy_bytes) = &p.privacy {
+                    NodeBuilder::new("participant")
+                        .attrs(attrs)
+                        .children([NodeBuilder::new("privacy")
+                            .string_content(hex::encode(privacy_bytes))
+                            .build()])
+                        .build()
+                } else {
+                    NodeBuilder::new("participant").attrs(attrs).build()
+                }
             })
             .collect();
 
-        let add_node = NodeBuilder::new("add").children(children).build();
+        let action_node = NodeBuilder::new("add").children(children).build();
 
         InfoQuery::set_ref(
             GROUP_IQ_NAMESPACE,
             &self.group_jid,
-            Some(NodeContent::Nodes(vec![add_node])),
+            Some(NodeContent::Nodes(vec![action_node])),
         )
     }
 
     fn parse_response(&self, response: &Node) -> Result<Self::Response> {
-        let add_node = required_child(response, "add")?;
-        collect_children::<ParticipantChangeResponse>(add_node, "participant")
+        let action_node = required_child(response, "add")?;
+        collect_children::<ParticipantChangeResponse>(action_node, "participant")
     }
 }
 
-/// IQ specification for removing participants from a group.
-///
-/// Wire format:
-/// ```xml
-/// <iq type="set" xmlns="w:g2" to="{group_jid}">
-///   <remove>
-///     <participant jid="{user_jid}"/>
-///   </remove>
-/// </iq>
-/// ```
-#[derive(Debug, Clone)]
-pub struct RemoveParticipantsIq {
-    pub group_jid: Jid,
-    pub participants: Vec<Jid>,
-}
+define_group_participant_iq!(
+    /// IQ specification for removing participants from a group.
+    ///
+    /// Wire format:
+    /// ```xml
+    /// <iq type="set" xmlns="w:g2" to="{group_jid}">
+    ///   <remove><participant jid="{user_jid}"/></remove>
+    /// </iq>
+    /// ```
+    RemoveParticipantsIq, action = "remove", response = Vec<ParticipantChangeResponse>
+);
 
-impl RemoveParticipantsIq {
-    pub fn new(group_jid: &Jid, participants: &[Jid]) -> Self {
-        Self {
-            group_jid: group_jid.clone(),
-            participants: participants.to_vec(),
-        }
-    }
-}
+define_group_participant_iq!(
+    /// IQ specification for promoting participants to admin.
+    ///
+    /// Wire format:
+    /// ```xml
+    /// <iq type="set" xmlns="w:g2" to="{group_jid}">
+    ///   <promote><participant jid="{user_jid}"/></promote>
+    /// </iq>
+    /// ```
+    PromoteParticipantsIq, action = "promote", response = ()
+);
 
-impl IqSpec for RemoveParticipantsIq {
-    type Response = Vec<ParticipantChangeResponse>;
-
-    fn build_iq(&self) -> InfoQuery<'static> {
-        let children: Vec<Node> = self
-            .participants
-            .iter()
-            .map(|jid| {
-                NodeBuilder::new("participant")
-                    .attr("jid", jid.to_string())
-                    .build()
-            })
-            .collect();
-
-        let remove_node = NodeBuilder::new("remove").children(children).build();
-
-        InfoQuery::set_ref(
-            GROUP_IQ_NAMESPACE,
-            &self.group_jid,
-            Some(NodeContent::Nodes(vec![remove_node])),
-        )
-    }
-
-    fn parse_response(&self, response: &Node) -> Result<Self::Response> {
-        let remove_node = required_child(response, "remove")?;
-        collect_children::<ParticipantChangeResponse>(remove_node, "participant")
-    }
-}
-
-/// IQ specification for promoting participants to admin.
-///
-/// Wire format:
-/// ```xml
-/// <iq type="set" xmlns="w:g2" to="{group_jid}">
-///   <promote>
-///     <participant jid="{user_jid}"/>
-///   </promote>
-/// </iq>
-/// ```
-#[derive(Debug, Clone)]
-pub struct PromoteParticipantsIq {
-    pub group_jid: Jid,
-    pub participants: Vec<Jid>,
-}
-
-impl PromoteParticipantsIq {
-    pub fn new(group_jid: &Jid, participants: &[Jid]) -> Self {
-        Self {
-            group_jid: group_jid.clone(),
-            participants: participants.to_vec(),
-        }
-    }
-}
-
-impl IqSpec for PromoteParticipantsIq {
-    type Response = ();
-
-    fn build_iq(&self) -> InfoQuery<'static> {
-        let children: Vec<Node> = self
-            .participants
-            .iter()
-            .map(|jid| {
-                NodeBuilder::new("participant")
-                    .attr("jid", jid.to_string())
-                    .build()
-            })
-            .collect();
-
-        let promote_node = NodeBuilder::new("promote").children(children).build();
-
-        InfoQuery::set_ref(
-            GROUP_IQ_NAMESPACE,
-            &self.group_jid,
-            Some(NodeContent::Nodes(vec![promote_node])),
-        )
-    }
-
-    fn parse_response(&self, _response: &Node) -> Result<Self::Response> {
-        Ok(())
-    }
-}
-
-/// IQ specification for demoting participants from admin.
-///
-/// Wire format:
-/// ```xml
-/// <iq type="set" xmlns="w:g2" to="{group_jid}">
-///   <demote>
-///     <participant jid="{user_jid}"/>
-///   </demote>
-/// </iq>
-/// ```
-#[derive(Debug, Clone)]
-pub struct DemoteParticipantsIq {
-    pub group_jid: Jid,
-    pub participants: Vec<Jid>,
-}
-
-impl DemoteParticipantsIq {
-    pub fn new(group_jid: &Jid, participants: &[Jid]) -> Self {
-        Self {
-            group_jid: group_jid.clone(),
-            participants: participants.to_vec(),
-        }
-    }
-}
-
-impl IqSpec for DemoteParticipantsIq {
-    type Response = ();
-
-    fn build_iq(&self) -> InfoQuery<'static> {
-        let children: Vec<Node> = self
-            .participants
-            .iter()
-            .map(|jid| {
-                NodeBuilder::new("participant")
-                    .attr("jid", jid.to_string())
-                    .build()
-            })
-            .collect();
-
-        let demote_node = NodeBuilder::new("demote").children(children).build();
-
-        InfoQuery::set_ref(
-            GROUP_IQ_NAMESPACE,
-            &self.group_jid,
-            Some(NodeContent::Nodes(vec![demote_node])),
-        )
-    }
-
-    fn parse_response(&self, _response: &Node) -> Result<Self::Response> {
-        Ok(())
-    }
-}
+define_group_participant_iq!(
+    /// IQ specification for demoting participants from admin.
+    ///
+    /// Wire format:
+    /// ```xml
+    /// <iq type="set" xmlns="w:g2" to="{group_jid}">
+    ///   <demote><participant jid="{user_jid}"/></demote>
+    /// </iq>
+    /// ```
+    DemoteParticipantsIq, action = "demote", response = ()
+);
 
 /// IQ specification for getting (or resetting) a group's invite link.
 ///
@@ -1047,6 +1263,927 @@ impl IqSpec for GetGroupInviteLinkIq {
         let invite_node = required_child(response, "invite")?;
         let code = required_attr(invite_node, "code")?;
         Ok(format!("https://chat.whatsapp.com/{code}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Group property setters (SetProperty RPC)
+// ---------------------------------------------------------------------------
+
+/// IQ specification for locking or unlocking a group (only admins can change group info).
+///
+/// Wire format:
+///  - Lock group:
+/// ```xml
+/// <iq type="set" xmlns="w:g2" to="{group_jid}">
+///   <locked/>
+/// </iq>
+/// ```
+///  - Unlock group:
+/// ```xml
+/// <iq type="set" xmlns="w:g2" to="{group_jid}">
+///   <unlocked/>
+/// </iq>
+/// ```
+#[derive(Debug, Clone)]
+pub struct SetGroupLockedIq {
+    pub group_jid: Jid,
+    pub locked: bool,
+}
+
+impl SetGroupLockedIq {
+    pub fn lock(group_jid: &Jid) -> Self {
+        Self {
+            group_jid: group_jid.clone(),
+            locked: true,
+        }
+    }
+
+    pub fn unlock(group_jid: &Jid) -> Self {
+        Self {
+            group_jid: group_jid.clone(),
+            locked: false,
+        }
+    }
+}
+
+impl IqSpec for SetGroupLockedIq {
+    type Response = ();
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        let tag = if self.locked { "locked" } else { "unlocked" };
+        InfoQuery::set_ref(
+            GROUP_IQ_NAMESPACE,
+            &self.group_jid,
+            Some(NodeContent::Nodes(vec![NodeBuilder::new(tag).build()])),
+        )
+    }
+
+    fn parse_response(&self, _response: &Node) -> Result<Self::Response> {
+        Ok(())
+    }
+}
+
+/// IQ specification for setting announcement mode (only admins can send messages).
+///
+/// Wire format:
+/// ```xml
+/// <iq type="set" xmlns="w:g2" to="{group_jid}">
+///   <announcement/>
+///   <!-- or -->
+///   <not_announcement/>
+/// </iq>
+/// ```
+#[derive(Debug, Clone)]
+pub struct SetGroupAnnouncementIq {
+    pub group_jid: Jid,
+    pub announce: bool,
+}
+
+impl SetGroupAnnouncementIq {
+    pub fn announce(group_jid: &Jid) -> Self {
+        Self {
+            group_jid: group_jid.clone(),
+            announce: true,
+        }
+    }
+
+    pub fn unannounce(group_jid: &Jid) -> Self {
+        Self {
+            group_jid: group_jid.clone(),
+            announce: false,
+        }
+    }
+}
+
+impl IqSpec for SetGroupAnnouncementIq {
+    type Response = ();
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        let tag = if self.announce {
+            "announcement"
+        } else {
+            "not_announcement"
+        };
+        InfoQuery::set_ref(
+            GROUP_IQ_NAMESPACE,
+            &self.group_jid,
+            Some(NodeContent::Nodes(vec![NodeBuilder::new(tag).build()])),
+        )
+    }
+
+    fn parse_response(&self, _response: &Node) -> Result<Self::Response> {
+        Ok(())
+    }
+}
+
+/// IQ specification for setting ephemeral (disappearing) messages on a group.
+///
+/// Wire format:
+/// ```xml
+/// <iq type="set" xmlns="w:g2" to="{group_jid}">
+///   <ephemeral expiration="86400"/>
+///   <!-- or to disable: -->
+///   <not_ephemeral/>
+/// </iq>
+/// ```
+///
+/// Common expiration values (seconds):
+/// - 86400 (24 hours)
+/// - 604800 (7 days)
+/// - 7776000 (90 days)
+/// - 0 or `not_ephemeral` to disable
+#[derive(Debug, Clone)]
+pub struct SetGroupEphemeralIq {
+    pub group_jid: Jid,
+    /// Expiration in seconds. `None` means disable.
+    pub expiration: Option<NonZeroU32>,
+}
+
+impl SetGroupEphemeralIq {
+    /// Enable ephemeral messages with the given expiration in seconds.
+    pub fn enable(group_jid: &Jid, expiration: NonZeroU32) -> Self {
+        Self {
+            group_jid: group_jid.clone(),
+            expiration: Some(expiration),
+        }
+    }
+
+    /// Disable ephemeral messages.
+    pub fn disable(group_jid: &Jid) -> Self {
+        Self {
+            group_jid: group_jid.clone(),
+            expiration: None,
+        }
+    }
+}
+
+impl IqSpec for SetGroupEphemeralIq {
+    type Response = ();
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        let node = match self.expiration {
+            Some(exp) => NodeBuilder::new("ephemeral")
+                .attr("expiration", exp.to_string())
+                .build(),
+            None => NodeBuilder::new("not_ephemeral").build(),
+        };
+        InfoQuery::set_ref(
+            GROUP_IQ_NAMESPACE,
+            &self.group_jid,
+            Some(NodeContent::Nodes(vec![node])),
+        )
+    }
+
+    fn parse_response(&self, _response: &Node) -> Result<Self::Response> {
+        Ok(())
+    }
+}
+
+/// IQ specification for setting the membership approval mode on a group.
+///
+/// When enabled, new members must be approved by an admin before joining.
+///
+/// Wire format:
+/// ```xml
+/// <iq type="set" xmlns="w:g2" to="{group_jid}">
+///   <membership_approval_mode>
+///     <group_join state="on"/>
+///   </membership_approval_mode>
+/// </iq>
+/// ```
+#[derive(Debug, Clone)]
+pub struct SetGroupMembershipApprovalIq {
+    pub group_jid: Jid,
+    pub mode: MembershipApprovalMode,
+}
+
+impl SetGroupMembershipApprovalIq {
+    pub fn new(group_jid: &Jid, mode: MembershipApprovalMode) -> Self {
+        Self {
+            group_jid: group_jid.clone(),
+            mode,
+        }
+    }
+}
+
+impl IqSpec for SetGroupMembershipApprovalIq {
+    type Response = ();
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        let node = NodeBuilder::new("membership_approval_mode")
+            .children([NodeBuilder::new("group_join")
+                .attr("state", self.mode.as_str())
+                .build()])
+            .build();
+        InfoQuery::set_ref(
+            GROUP_IQ_NAMESPACE,
+            &self.group_jid,
+            Some(NodeContent::Nodes(vec![node])),
+        )
+    }
+
+    fn parse_response(&self, _response: &Node) -> Result<Self::Response> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Community IQ Specs
+// ---------------------------------------------------------------------------
+
+/// Response for a single group in a link/unlink operation.
+#[derive(Debug, Clone)]
+pub struct LinkedGroupResult {
+    pub jid: Jid,
+    /// Error code if the operation failed for this group (e.g. 406 = community full).
+    pub error: Option<u32>,
+}
+
+/// Response from linking subgroups to a community.
+#[derive(Debug, Clone)]
+pub struct LinkSubgroupsResponse {
+    pub groups: Vec<LinkedGroupResult>,
+}
+
+/// Response from unlinking subgroups from a community.
+#[derive(Debug, Clone)]
+pub struct UnlinkSubgroupsResponse {
+    pub groups: Vec<LinkedGroupResult>,
+}
+
+/// IQ specification for linking subgroups to a community parent group.
+///
+/// Wire format:
+/// ```xml
+/// <iq type="set" xmlns="w:g2" to="{parent_jid}">
+///   <links>
+///     <link link_type="sub_group">
+///       <group jid="{subgroup_jid}"/>
+///     </link>
+///   </links>
+/// </iq>
+/// ```
+#[derive(Debug, Clone)]
+pub struct LinkSubgroupsIq {
+    pub parent_jid: Jid,
+    pub subgroup_jids: Vec<Jid>,
+}
+
+impl LinkSubgroupsIq {
+    pub fn new(parent_jid: &Jid, subgroup_jids: &[Jid]) -> Self {
+        Self {
+            parent_jid: parent_jid.clone(),
+            subgroup_jids: subgroup_jids.to_vec(),
+        }
+    }
+}
+
+impl IqSpec for LinkSubgroupsIq {
+    type Response = LinkSubgroupsResponse;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        let group_nodes: Vec<Node> = self
+            .subgroup_jids
+            .iter()
+            .map(|jid| NodeBuilder::new("group").attr("jid", jid.clone()).build())
+            .collect();
+
+        let link_node = NodeBuilder::new("link")
+            .attr("link_type", "sub_group")
+            .children(group_nodes)
+            .build();
+
+        let links_node = NodeBuilder::new("links").children([link_node]).build();
+
+        InfoQuery::set_ref(
+            GROUP_IQ_NAMESPACE,
+            &self.parent_jid,
+            Some(NodeContent::Nodes(vec![links_node])),
+        )
+    }
+
+    fn parse_response(&self, response: &Node) -> Result<Self::Response> {
+        let links_node = required_child(response, "links")?;
+        let link_node = required_child(links_node, "link")?;
+
+        let mut groups = Vec::new();
+        for child in link_node.get_children_by_tag("group") {
+            let jid_str = required_attr(child, "jid")?;
+            let jid: Jid = jid_str.parse()?;
+            let error = child
+                .attrs()
+                .optional_string("error")
+                .and_then(|s| s.parse::<u32>().ok());
+            groups.push(LinkedGroupResult { jid, error });
+        }
+
+        Ok(LinkSubgroupsResponse { groups })
+    }
+}
+
+/// IQ specification for unlinking subgroups from a community parent group.
+///
+/// Wire format:
+/// ```xml
+/// <iq type="set" xmlns="w:g2" to="{parent_jid}">
+///   <unlink unlink_type="sub_group">
+///     <group jid="{subgroup_jid}"/>
+///   </unlink>
+/// </iq>
+/// ```
+#[derive(Debug, Clone)]
+pub struct UnlinkSubgroupsIq {
+    pub parent_jid: Jid,
+    pub subgroup_jids: Vec<Jid>,
+    pub remove_orphan_members: bool,
+}
+
+impl UnlinkSubgroupsIq {
+    pub fn new(parent_jid: &Jid, subgroup_jids: &[Jid], remove_orphan_members: bool) -> Self {
+        Self {
+            parent_jid: parent_jid.clone(),
+            subgroup_jids: subgroup_jids.to_vec(),
+            remove_orphan_members,
+        }
+    }
+}
+
+impl IqSpec for UnlinkSubgroupsIq {
+    type Response = UnlinkSubgroupsResponse;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        let group_nodes: Vec<Node> = self
+            .subgroup_jids
+            .iter()
+            .map(|jid| {
+                let mut builder = NodeBuilder::new("group").attr("jid", jid.clone());
+                if self.remove_orphan_members {
+                    builder = builder.attr("remove_orphaned_members", "true");
+                }
+                builder.build()
+            })
+            .collect();
+
+        let unlink_node = NodeBuilder::new("unlink")
+            .attr("unlink_type", "sub_group")
+            .children(group_nodes)
+            .build();
+
+        InfoQuery::set_ref(
+            GROUP_IQ_NAMESPACE,
+            &self.parent_jid,
+            Some(NodeContent::Nodes(vec![unlink_node])),
+        )
+    }
+
+    fn parse_response(&self, response: &Node) -> Result<Self::Response> {
+        let unlink_node = required_child(response, "unlink")?;
+
+        let mut groups = Vec::new();
+        for child in unlink_node.get_children_by_tag("group") {
+            let jid_str = required_attr(child, "jid")?;
+            let jid: Jid = jid_str.parse()?;
+            let error = child
+                .attrs()
+                .optional_string("error")
+                .and_then(|s| s.parse::<u32>().ok());
+            groups.push(LinkedGroupResult { jid, error });
+        }
+
+        Ok(UnlinkSubgroupsResponse { groups })
+    }
+}
+
+/// IQ specification for deleting (deactivating) a community.
+///
+/// Wire format:
+/// ```xml
+/// <iq type="set" xmlns="w:g2" to="{parent_jid}">
+///   <delete_parent/>
+/// </iq>
+/// ```
+#[derive(Debug, Clone)]
+pub struct DeleteCommunityIq {
+    pub parent_jid: Jid,
+}
+
+impl DeleteCommunityIq {
+    pub fn new(parent_jid: &Jid) -> Self {
+        Self {
+            parent_jid: parent_jid.clone(),
+        }
+    }
+}
+
+impl IqSpec for DeleteCommunityIq {
+    type Response = ();
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        InfoQuery::set_ref(
+            GROUP_IQ_NAMESPACE,
+            &self.parent_jid,
+            Some(NodeContent::Nodes(vec![
+                NodeBuilder::new("delete_parent").build(),
+            ])),
+        )
+    }
+
+    fn parse_response(&self, _response: &Node) -> Result<Self::Response> {
+        Ok(())
+    }
+}
+
+/// IQ specification for querying a linked subgroup's info from the parent community.
+///
+/// Wire format:
+/// ```xml
+/// <iq type="get" xmlns="w:g2" to="{parent_jid}">
+///   <query_linked type="sub_group" jid="{subgroup_jid}"/>
+/// </iq>
+/// ```
+#[derive(Debug, Clone)]
+pub struct QueryLinkedGroupIq {
+    pub parent_jid: Jid,
+    pub subgroup_jid: Jid,
+}
+
+impl QueryLinkedGroupIq {
+    pub fn new(parent_jid: &Jid, subgroup_jid: &Jid) -> Self {
+        Self {
+            parent_jid: parent_jid.clone(),
+            subgroup_jid: subgroup_jid.clone(),
+        }
+    }
+}
+
+impl IqSpec for QueryLinkedGroupIq {
+    type Response = GroupInfoResponse;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        let query_node = NodeBuilder::new("query_linked")
+            .attr("type", "sub_group")
+            .attr("jid", self.subgroup_jid.clone())
+            .build();
+
+        InfoQuery::get_ref(
+            GROUP_IQ_NAMESPACE,
+            &self.parent_jid,
+            Some(NodeContent::Nodes(vec![query_node])),
+        )
+    }
+
+    fn parse_response(&self, response: &Node) -> Result<Self::Response> {
+        let linked_node = required_child(response, "linked_group")?;
+        let group_node = required_child(linked_node, "group")?;
+        GroupInfoResponse::try_from_node(group_node)
+    }
+}
+
+/// IQ specification for joining a linked subgroup via the parent community.
+///
+/// Wire format:
+/// ```xml
+/// <iq type="set" xmlns="w:g2" to="{parent_jid}">
+///   <join_linked_group jid="{subgroup_jid}"/>
+/// </iq>
+/// ```
+#[derive(Debug, Clone)]
+pub struct JoinLinkedGroupIq {
+    pub parent_jid: Jid,
+    pub subgroup_jid: Jid,
+}
+
+impl JoinLinkedGroupIq {
+    pub fn new(parent_jid: &Jid, subgroup_jid: &Jid) -> Self {
+        Self {
+            parent_jid: parent_jid.clone(),
+            subgroup_jid: subgroup_jid.clone(),
+        }
+    }
+}
+
+impl IqSpec for JoinLinkedGroupIq {
+    type Response = GroupInfoResponse;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        let node = NodeBuilder::new("join_linked_group")
+            .attr("jid", self.subgroup_jid.clone())
+            .build();
+
+        InfoQuery::set_ref(
+            GROUP_IQ_NAMESPACE,
+            &self.parent_jid,
+            Some(NodeContent::Nodes(vec![node])),
+        )
+    }
+
+    fn parse_response(&self, response: &Node) -> Result<Self::Response> {
+        let linked_node = required_child(response, "linked_group")?;
+        let group_node = required_child(linked_node, "group")?;
+        GroupInfoResponse::try_from_node(group_node)
+    }
+}
+
+/// IQ specification for getting all participants across linked groups.
+///
+/// Wire format:
+/// ```xml
+/// <iq type="get" xmlns="w:g2" to="{parent_jid}">
+///   <linked_groups_participants/>
+/// </iq>
+/// ```
+#[derive(Debug, Clone)]
+pub struct GetLinkedGroupsParticipantsIq {
+    pub parent_jid: Jid,
+}
+
+impl GetLinkedGroupsParticipantsIq {
+    pub fn new(parent_jid: &Jid) -> Self {
+        Self {
+            parent_jid: parent_jid.clone(),
+        }
+    }
+}
+
+impl IqSpec for GetLinkedGroupsParticipantsIq {
+    type Response = Vec<GroupParticipantResponse>;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        InfoQuery::get_ref(
+            GROUP_IQ_NAMESPACE,
+            &self.parent_jid,
+            Some(NodeContent::Nodes(vec![
+                NodeBuilder::new("linked_groups_participants").build(),
+            ])),
+        )
+    }
+
+    fn parse_response(&self, response: &Node) -> Result<Self::Response> {
+        let container = required_child(response, "linked_groups_participants")?;
+
+        // Participants may be direct children or nested inside <group> nodes.
+        let direct = collect_children::<GroupParticipantResponse>(container, "participant")?;
+        if !direct.is_empty() {
+            return Ok(direct);
+        }
+
+        // Nested: <linked_groups_participants><group><participant/></group></linked_groups_participants>
+        let mut all = Vec::new();
+        for group_node in container.get_children_by_tag("group") {
+            let participants =
+                collect_children::<GroupParticipantResponse>(group_node, "participant")?;
+            all.extend(participants);
+        }
+        Ok(all)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Accept group invite (join via code)
+// ---------------------------------------------------------------------------
+
+/// Result of joining a group via invite code.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JoinGroupResult {
+    Joined(Jid),
+    PendingApproval(Jid),
+}
+
+impl JoinGroupResult {
+    pub fn group_jid(&self) -> &Jid {
+        match self {
+            JoinGroupResult::Joined(jid) | JoinGroupResult::PendingApproval(jid) => jid,
+        }
+    }
+}
+
+/// Shared response parser for group join IQs (both code-based and V4 invite).
+fn parse_join_group_response(response: &Node) -> Result<JoinGroupResult> {
+    if let Some(group_node) = response.get_optional_child("group") {
+        let jid_str = required_attr(group_node, "jid")?;
+        let jid: Jid = jid_str
+            .parse()
+            .map_err(|e| anyhow!("invalid group jid: {e}"))?;
+        return Ok(JoinGroupResult::Joined(jid));
+    }
+    if let Some(approval_node) = response.get_optional_child("membership_approval_request") {
+        let jid_str = required_attr(approval_node, "jid")?;
+        let jid: Jid = jid_str
+            .parse()
+            .map_err(|e| anyhow!("invalid group jid: {e}"))?;
+        return Ok(JoinGroupResult::PendingApproval(jid));
+    }
+    Err(anyhow!(
+        "expected <group> or <membership_approval_request> in join response"
+    ))
+}
+
+/// ```xml
+/// <iq type="set" xmlns="w:g2" to="@g.us">
+///   <invite code="{code}"/>
+/// </iq>
+/// ```
+#[derive(Debug, Clone)]
+pub struct AcceptGroupInviteIq {
+    pub code: String,
+}
+
+impl AcceptGroupInviteIq {
+    pub fn new(code: impl Into<String>) -> Self {
+        Self { code: code.into() }
+    }
+}
+
+impl IqSpec for AcceptGroupInviteIq {
+    type Response = JoinGroupResult;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        let to = Jid::new("", GROUP_SERVER);
+        InfoQuery::set_ref(
+            GROUP_IQ_NAMESPACE,
+            &to,
+            Some(NodeContent::Nodes(vec![
+                NodeBuilder::new("invite").attr("code", &self.code).build(),
+            ])),
+        )
+    }
+
+    fn parse_response(&self, response: &Node) -> Result<Self::Response> {
+        parse_join_group_response(response)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Accept group invite V4 (via invite message)
+// ---------------------------------------------------------------------------
+
+/// Accepts a V4 invite (sent as a GroupInviteMessage, not a link).
+/// Sends `<accept>` to the group JID with code, expiration, and admin.
+pub struct AcceptGroupInviteV4Iq {
+    pub group_jid: Jid,
+    pub code: String,
+    pub expiration: i64,
+    pub admin_jid: Jid,
+}
+
+impl AcceptGroupInviteV4Iq {
+    pub fn new(group_jid: Jid, code: String, expiration: i64, admin_jid: Jid) -> Self {
+        Self {
+            group_jid,
+            code,
+            expiration,
+            admin_jid,
+        }
+    }
+}
+
+impl IqSpec for AcceptGroupInviteV4Iq {
+    type Response = JoinGroupResult;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        InfoQuery::set_ref(
+            GROUP_IQ_NAMESPACE,
+            &self.group_jid,
+            Some(NodeContent::Nodes(vec![
+                NodeBuilder::new("accept")
+                    .attr("code", &self.code)
+                    .attr("expiration", self.expiration.to_string())
+                    .attr("admin", self.admin_jid.to_string())
+                    .build(),
+            ])),
+        )
+    }
+
+    fn parse_response(&self, response: &Node) -> Result<Self::Response> {
+        parse_join_group_response(response)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Get group info by invite code
+// ---------------------------------------------------------------------------
+
+/// Get group metadata from an invite code without joining.
+///
+/// ```xml
+/// <iq type="get" xmlns="w:g2" to="@g.us">
+///   <invite code="{code}"/>
+/// </iq>
+/// ```
+#[derive(Debug, Clone)]
+pub struct GetGroupInviteInfoIq {
+    pub code: String,
+}
+
+impl GetGroupInviteInfoIq {
+    pub fn new(code: impl Into<String>) -> Self {
+        Self { code: code.into() }
+    }
+}
+
+impl IqSpec for GetGroupInviteInfoIq {
+    type Response = GroupInfoResponse;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        let to = Jid::new("", GROUP_SERVER);
+        InfoQuery::get_ref(
+            GROUP_IQ_NAMESPACE,
+            &to,
+            Some(NodeContent::Nodes(vec![
+                NodeBuilder::new("invite").attr("code", &self.code).build(),
+            ])),
+        )
+    }
+
+    fn parse_response(&self, response: &Node) -> Result<Self::Response> {
+        let group_node = required_child(response, "group")?;
+        GroupInfoResponse::try_from_node(group_node)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Membership approval requests
+// ---------------------------------------------------------------------------
+
+/// Get pending membership approval requests for a group.
+///
+/// ```xml
+/// <iq type="get" xmlns="w:g2" to="{group_jid}">
+///   <membership_approval_requests/>
+/// </iq>
+/// ```
+#[derive(Debug, Clone)]
+pub struct GetMembershipRequestsIq {
+    pub group_jid: Jid,
+}
+
+impl GetMembershipRequestsIq {
+    pub fn new(jid: &Jid) -> Self {
+        Self {
+            group_jid: jid.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MembershipRequest {
+    pub jid: Jid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_time: Option<u64>,
+}
+
+impl IqSpec for GetMembershipRequestsIq {
+    type Response = Vec<MembershipRequest>;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        InfoQuery::get_ref(
+            GROUP_IQ_NAMESPACE,
+            &self.group_jid,
+            Some(NodeContent::Nodes(vec![
+                NodeBuilder::new("membership_approval_requests").build(),
+            ])),
+        )
+    }
+
+    fn parse_response(&self, response: &Node) -> Result<Self::Response> {
+        let requests_node = response
+            .get_optional_child("membership_approval_requests")
+            .ok_or_else(|| anyhow!("missing membership_approval_requests"))?;
+
+        let mut requests = Vec::new();
+        for child in requests_node.get_children_by_tag("membership_approval_request") {
+            let jid_str = required_attr(child, "jid")?;
+            let jid: Jid = jid_str
+                .parse()
+                .map_err(|e| anyhow!("invalid jid in membership request: {e}"))?;
+            let request_time = child
+                .attrs()
+                .optional_string("request_time")
+                .and_then(|s| s.parse::<u64>().ok());
+            requests.push(MembershipRequest { jid, request_time });
+        }
+        Ok(requests)
+    }
+}
+
+/// Approve or reject pending membership requests.
+///
+/// ```xml
+/// <iq type="set" xmlns="w:g2" to="{group_jid}">
+///   <membership_requests_action>
+///     <approve> or <reject>
+///       <participant jid="{jid}"/>
+///     </approve>
+///   </membership_requests_action>
+/// </iq>
+/// ```
+#[derive(Debug, Clone)]
+pub struct MembershipRequestActionIq {
+    pub group_jid: Jid,
+    pub participants: Vec<Jid>,
+    pub approve: bool,
+}
+
+impl MembershipRequestActionIq {
+    pub fn approve(group_jid: &Jid, participants: &[Jid]) -> Self {
+        Self {
+            group_jid: group_jid.clone(),
+            participants: participants.to_vec(),
+            approve: true,
+        }
+    }
+
+    pub fn reject(group_jid: &Jid, participants: &[Jid]) -> Self {
+        Self {
+            group_jid: group_jid.clone(),
+            participants: participants.to_vec(),
+            approve: false,
+        }
+    }
+}
+
+impl IqSpec for MembershipRequestActionIq {
+    type Response = Vec<ParticipantChangeResponse>;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        let action_tag = if self.approve { "approve" } else { "reject" };
+        let participant_nodes: Vec<Node> = self
+            .participants
+            .iter()
+            .map(|jid| {
+                NodeBuilder::new("participant")
+                    .attr("jid", jid.clone())
+                    .build()
+            })
+            .collect();
+
+        InfoQuery::set_ref(
+            GROUP_IQ_NAMESPACE,
+            &self.group_jid,
+            Some(NodeContent::Nodes(vec![
+                NodeBuilder::new("membership_requests_action")
+                    .children(vec![
+                        NodeBuilder::new(action_tag)
+                            .children(participant_nodes)
+                            .build(),
+                    ])
+                    .build(),
+            ])),
+        )
+    }
+
+    fn parse_response(&self, response: &Node) -> Result<Self::Response> {
+        let action_node = required_child(response, "membership_requests_action")?;
+        let action_tag = if self.approve { "approve" } else { "reject" };
+        let inner = required_child(action_node, action_tag)?;
+        collect_children::<ParticipantChangeResponse>(inner, "participant")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Member add mode
+// ---------------------------------------------------------------------------
+
+/// Set who can add members to the group.
+///
+/// ```xml
+/// <iq type="set" xmlns="w:g2" to="{group_jid}">
+///   <member_add_mode>admin_add|all_member_add</member_add_mode>
+/// </iq>
+/// ```
+#[derive(Debug, Clone)]
+pub struct SetMemberAddModeIq {
+    pub group_jid: Jid,
+    pub mode: MemberAddMode,
+}
+
+impl SetMemberAddModeIq {
+    pub fn new(jid: &Jid, mode: MemberAddMode) -> Self {
+        Self {
+            group_jid: jid.clone(),
+            mode,
+        }
+    }
+}
+
+impl IqSpec for SetMemberAddModeIq {
+    type Response = ();
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        InfoQuery::set_ref(
+            GROUP_IQ_NAMESPACE,
+            &self.group_jid,
+            Some(NodeContent::Nodes(vec![
+                NodeBuilder::new("member_add_mode")
+                    .string_content(self.mode.as_str())
+                    .build(),
+            ])),
+        )
+    }
+
+    fn parse_response(&self, _response: &Node) -> Result<Self::Response> {
+        Ok(())
     }
 }
 
@@ -1135,7 +2272,7 @@ mod tests {
         let node = build_create_group_node(&options);
         assert_eq!(node.tag, "create");
         assert_eq!(
-            node.attrs().optional_string("subject"),
+            node.attrs().optional_string("subject").as_deref(),
             Some("Test Subject")
         );
 
@@ -1173,7 +2310,10 @@ mod tests {
             // id is random hex, just check it exists and is 8 chars
             let id = desc_node.attrs().optional_string("id").unwrap();
             assert_eq!(id.len(), 8);
-            assert_eq!(desc_node.attrs().optional_string("prev"), Some("AABBCCDD"));
+            assert_eq!(
+                desc_node.attrs().optional_string("prev").as_deref(),
+                Some("AABBCCDD")
+            );
             // Should have a <body> child
             assert!(desc_node.get_children_by_tag("body").next().is_some());
         } else {
@@ -1190,8 +2330,14 @@ mod tests {
         if let Some(NodeContent::Nodes(nodes)) = &iq.content {
             let desc_node = &nodes[0];
             assert_eq!(desc_node.tag, "description");
-            assert_eq!(desc_node.attrs().optional_string("delete"), Some("true"));
-            assert_eq!(desc_node.attrs().optional_string("prev"), Some("PREV1234"));
+            assert_eq!(
+                desc_node.attrs().optional_string("delete").as_deref(),
+                Some("true")
+            );
+            assert_eq!(
+                desc_node.attrs().optional_string("prev").as_deref(),
+                Some("PREV1234")
+            );
             // id should still be present
             assert!(desc_node.attrs().optional_string("id").is_some());
         } else {
@@ -1227,6 +2373,90 @@ mod tests {
             assert_eq!(add_node.tag, "add");
             let participants: Vec<_> = add_node.get_children_by_tag("participant").collect();
             assert_eq!(participants.len(), 2);
+        } else {
+            panic!("expected nodes content");
+        }
+    }
+
+    #[test]
+    fn test_add_participants_with_options_privacy() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let p1 = GroupParticipantOptions {
+            jid: "1234567890@s.whatsapp.net".parse().unwrap(),
+            phone_number: None,
+            privacy: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+        };
+        let spec = AddParticipantsIq::with_options(&group, vec![p1]);
+        let iq = spec.build_iq();
+
+        if let Some(NodeContent::Nodes(nodes)) = &iq.content {
+            let add_node = &nodes[0];
+            assert_eq!(add_node.tag, "add");
+
+            let participants: Vec<_> = add_node.get_children_by_tag("participant").collect();
+            assert_eq!(participants.len(), 1);
+
+            let privacy_children: Vec<_> = participants[0].get_children_by_tag("privacy").collect();
+            assert_eq!(privacy_children.len(), 1, "expected a <privacy> child node");
+
+            match &privacy_children[0].content {
+                Some(NodeContent::String(s)) => assert_eq!(s, "deadbeef"),
+                other => panic!("expected String content in <privacy>, got: {:?}", other),
+            }
+        } else {
+            panic!("expected nodes content");
+        }
+    }
+
+    #[test]
+    fn test_add_participants_with_options_no_privacy() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let p1 = GroupParticipantOptions {
+            jid: "1234567890@s.whatsapp.net".parse().unwrap(),
+            phone_number: None,
+            privacy: None,
+        };
+        let spec = AddParticipantsIq::with_options(&group, vec![p1]);
+        let iq = spec.build_iq();
+
+        if let Some(NodeContent::Nodes(nodes)) = &iq.content {
+            let add_node = &nodes[0];
+            assert_eq!(add_node.tag, "add");
+
+            let participants: Vec<_> = add_node.get_children_by_tag("participant").collect();
+            assert_eq!(participants.len(), 1);
+
+            let privacy_children: Vec<_> = participants[0].get_children_by_tag("privacy").collect();
+            assert!(
+                privacy_children.is_empty(),
+                "expected no <privacy> child when privacy is None"
+            );
+        } else {
+            panic!("expected nodes content");
+        }
+    }
+
+    #[test]
+    fn test_add_participants_strips_phone_number_for_pn_jid() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let pn_jid: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
+        // PN JID with phone_number set: build_iq should strip it
+        let p1 = GroupParticipantOptions::new(pn_jid.clone())
+            .with_phone_number("9876543210@s.whatsapp.net".parse().unwrap());
+        let spec = AddParticipantsIq::with_options(&group, vec![p1]);
+        let iq = spec.build_iq();
+
+        if let Some(NodeContent::Nodes(nodes)) = &iq.content {
+            let add_node = &nodes[0];
+            let participants: Vec<_> = add_node.get_children_by_tag("participant").collect();
+            assert_eq!(participants.len(), 1);
+            assert!(
+                participants[0]
+                    .attrs()
+                    .optional_string("phone_number")
+                    .is_none(),
+                "phone_number should be stripped for non-LID JIDs"
+            );
         } else {
             panic!("expected nodes content");
         }
@@ -1293,5 +2523,348 @@ mod tests {
         let result = ParticipantChangeResponse::try_from_node(&node).unwrap();
         assert_eq!(result.jid.user, "1234567890");
         assert_eq!(result.status, Some("200".to_string()));
+    }
+
+    #[test]
+    fn test_set_group_locked_iq() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+
+        let lock = SetGroupLockedIq::lock(&group);
+        let iq = lock.build_iq();
+        assert_eq!(iq.query_type, InfoQueryType::Set);
+        assert_eq!(iq.to, group);
+        if let Some(NodeContent::Nodes(nodes)) = &iq.content {
+            assert_eq!(nodes[0].tag, "locked");
+        } else {
+            panic!("expected nodes content");
+        }
+
+        let unlock = SetGroupLockedIq::unlock(&group);
+        let iq = unlock.build_iq();
+        if let Some(NodeContent::Nodes(nodes)) = &iq.content {
+            assert_eq!(nodes[0].tag, "unlocked");
+        } else {
+            panic!("expected nodes content");
+        }
+    }
+
+    #[test]
+    fn test_set_group_announcement_iq() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+
+        let announce = SetGroupAnnouncementIq::announce(&group);
+        let iq = announce.build_iq();
+        if let Some(NodeContent::Nodes(nodes)) = &iq.content {
+            assert_eq!(nodes[0].tag, "announcement");
+        } else {
+            panic!("expected nodes content");
+        }
+
+        let not_announce = SetGroupAnnouncementIq::unannounce(&group);
+        let iq = not_announce.build_iq();
+        if let Some(NodeContent::Nodes(nodes)) = &iq.content {
+            assert_eq!(nodes[0].tag, "not_announcement");
+        } else {
+            panic!("expected nodes content");
+        }
+    }
+
+    #[test]
+    fn test_set_group_ephemeral_iq() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+
+        let enable = SetGroupEphemeralIq::enable(&group, NonZeroU32::new(86400).unwrap());
+        let iq = enable.build_iq();
+        if let Some(NodeContent::Nodes(nodes)) = &iq.content {
+            assert_eq!(nodes[0].tag, "ephemeral");
+            assert_eq!(
+                nodes[0].attrs().optional_string("expiration").as_deref(),
+                Some("86400")
+            );
+        } else {
+            panic!("expected nodes content");
+        }
+
+        let disable = SetGroupEphemeralIq::disable(&group);
+        let iq = disable.build_iq();
+        if let Some(NodeContent::Nodes(nodes)) = &iq.content {
+            assert_eq!(nodes[0].tag, "not_ephemeral");
+        } else {
+            panic!("expected nodes content");
+        }
+    }
+
+    #[test]
+    fn test_set_group_membership_approval_iq() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+
+        let spec = SetGroupMembershipApprovalIq::new(&group, MembershipApprovalMode::On);
+        let iq = spec.build_iq();
+        if let Some(NodeContent::Nodes(nodes)) = &iq.content {
+            assert_eq!(nodes[0].tag, "membership_approval_mode");
+            let join = nodes[0].get_children_by_tag("group_join").next().unwrap();
+            assert!(join.attrs.get("state").is_some_and(|v| v == "on"));
+        } else {
+            panic!("expected nodes content");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Community IQ spec tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_create_community_node() {
+        let options = GroupCreateOptions {
+            subject: "My Community".to_string(),
+            is_parent: true,
+            closed: true,
+            allow_non_admin_sub_group_creation: true,
+            create_general_chat: true,
+            ..Default::default()
+        };
+
+        let node = build_create_group_node(&options);
+        assert_eq!(node.tag, "create");
+
+        // Should have <parent default_membership_approval_mode="request_required"/>
+        let parent = node.get_children_by_tag("parent").next().unwrap();
+        assert_eq!(
+            parent
+                .attrs()
+                .optional_string("default_membership_approval_mode")
+                .as_deref(),
+            Some("request_required")
+        );
+
+        assert!(
+            node.get_children_by_tag("allow_non_admin_sub_group_creation")
+                .next()
+                .is_some()
+        );
+        assert!(
+            node.get_children_by_tag("create_general_chat")
+                .next()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_build_create_non_community_omits_parent() {
+        let options = GroupCreateOptions {
+            subject: "Regular Group".to_string(),
+            is_parent: false,
+            ..Default::default()
+        };
+
+        let node = build_create_group_node(&options);
+        assert!(
+            node.get_children_by_tag("parent").next().is_none(),
+            "non-community group should not have <parent>"
+        );
+    }
+
+    #[test]
+    fn test_link_subgroups_iq_build() {
+        let parent: Jid = "120363000000000001@g.us".parse().unwrap();
+        let sub: Jid = "120363000000000002@g.us".parse().unwrap();
+
+        let spec = LinkSubgroupsIq::new(&parent, std::slice::from_ref(&sub));
+        let iq = spec.build_iq();
+
+        assert_eq!(iq.to, parent);
+        if let Some(NodeContent::Nodes(nodes)) = &iq.content {
+            let links = &nodes[0];
+            assert_eq!(links.tag, "links");
+            let link = links.get_children_by_tag("link").next().unwrap();
+            assert_eq!(
+                link.attrs().optional_string("link_type").as_deref(),
+                Some("sub_group")
+            );
+            let group = link.get_children_by_tag("group").next().unwrap();
+            assert_eq!(group.attrs().optional_jid("jid"), Some(sub));
+        } else {
+            panic!("expected nodes content");
+        }
+    }
+
+    #[test]
+    fn test_link_subgroups_iq_parse_response() {
+        let parent: Jid = "120363000000000001@g.us".parse().unwrap();
+        let sub: Jid = "120363000000000002@g.us".parse().unwrap();
+
+        let response = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("links")
+                .children([NodeBuilder::new("link")
+                    .attr("link_type", "sub_group")
+                    .children([NodeBuilder::new("group")
+                        .attr("jid", sub.to_string())
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+
+        let spec = LinkSubgroupsIq::new(&parent, std::slice::from_ref(&sub));
+        let result = spec.parse_response(&response).unwrap();
+        assert_eq!(result.groups.len(), 1);
+        assert_eq!(result.groups[0].jid, sub);
+        assert!(result.groups[0].error.is_none());
+    }
+
+    #[test]
+    fn test_unlink_subgroups_iq_build() {
+        let parent: Jid = "120363000000000001@g.us".parse().unwrap();
+        let sub: Jid = "120363000000000002@g.us".parse().unwrap();
+
+        let spec = UnlinkSubgroupsIq::new(&parent, std::slice::from_ref(&sub), true);
+        let iq = spec.build_iq();
+
+        if let Some(NodeContent::Nodes(nodes)) = &iq.content {
+            let unlink = &nodes[0];
+            assert_eq!(unlink.tag, "unlink");
+            assert_eq!(
+                unlink.attrs().optional_string("unlink_type").as_deref(),
+                Some("sub_group")
+            );
+            let group = unlink.get_children_by_tag("group").next().unwrap();
+            assert_eq!(group.attrs().optional_jid("jid"), Some(sub));
+            assert_eq!(
+                group
+                    .attrs()
+                    .optional_string("remove_orphaned_members")
+                    .as_deref(),
+                Some("true")
+            );
+        } else {
+            panic!("expected nodes content");
+        }
+    }
+
+    #[test]
+    fn test_unlink_subgroups_iq_parse_response_with_error() {
+        let parent: Jid = "120363000000000001@g.us".parse().unwrap();
+        let sub: Jid = "120363000000000002@g.us".parse().unwrap();
+
+        let response = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("unlink")
+                .attr("unlink_type", "sub_group")
+                .children([NodeBuilder::new("group")
+                    .attr("jid", sub.to_string())
+                    .attr("error", "406")
+                    .build()])
+                .build()])
+            .build();
+
+        let spec = UnlinkSubgroupsIq::new(&parent, std::slice::from_ref(&sub), false);
+        let result = spec.parse_response(&response).unwrap();
+        assert_eq!(result.groups.len(), 1);
+        assert_eq!(result.groups[0].jid, sub);
+        assert_eq!(result.groups[0].error, Some(406));
+    }
+
+    #[test]
+    fn test_delete_community_iq_build() {
+        let parent: Jid = "120363000000000001@g.us".parse().unwrap();
+        let spec = DeleteCommunityIq::new(&parent);
+        let iq = spec.build_iq();
+
+        assert_eq!(iq.to, parent);
+        if let Some(NodeContent::Nodes(nodes)) = &iq.content {
+            assert_eq!(nodes[0].tag, "delete_parent");
+        } else {
+            panic!("expected nodes content");
+        }
+    }
+
+    #[test]
+    fn test_query_linked_group_iq_build() {
+        let parent: Jid = "120363000000000001@g.us".parse().unwrap();
+        let sub: Jid = "120363000000000002@g.us".parse().unwrap();
+
+        let spec = QueryLinkedGroupIq::new(&parent, &sub);
+        let iq = spec.build_iq();
+
+        if let Some(NodeContent::Nodes(nodes)) = &iq.content {
+            let query = &nodes[0];
+            assert_eq!(query.tag, "query_linked");
+            assert_eq!(
+                query.attrs().optional_string("type").as_deref(),
+                Some("sub_group")
+            );
+            assert_eq!(query.attrs().optional_jid("jid"), Some(sub));
+        } else {
+            panic!("expected nodes content");
+        }
+    }
+
+    #[test]
+    fn test_join_linked_group_iq_build() {
+        let parent: Jid = "120363000000000001@g.us".parse().unwrap();
+        let sub: Jid = "120363000000000002@g.us".parse().unwrap();
+
+        let spec = JoinLinkedGroupIq::new(&parent, &sub);
+        let iq = spec.build_iq();
+
+        assert_eq!(iq.to, parent);
+        if let Some(NodeContent::Nodes(nodes)) = &iq.content {
+            let join = &nodes[0];
+            assert_eq!(join.tag, "join_linked_group");
+            assert_eq!(join.attrs().optional_jid("jid"), Some(sub));
+        } else {
+            panic!("expected nodes content");
+        }
+    }
+
+    #[test]
+    fn test_get_linked_groups_participants_iq_build() {
+        let parent: Jid = "120363000000000001@g.us".parse().unwrap();
+        let spec = GetLinkedGroupsParticipantsIq::new(&parent);
+        let iq = spec.build_iq();
+
+        assert_eq!(iq.to, parent);
+        if let Some(NodeContent::Nodes(nodes)) = &iq.content {
+            assert_eq!(nodes[0].tag, "linked_groups_participants");
+        } else {
+            panic!("expected nodes content");
+        }
+    }
+
+    #[test]
+    fn test_group_info_response_parses_community_fields() {
+        let node = NodeBuilder::new("group")
+            .attr("id", "120363000000000001@g.us")
+            .attr("subject", "My Community")
+            .children([
+                NodeBuilder::new("parent").build(),
+                NodeBuilder::new("allow_non_admin_sub_group_creation").build(),
+            ])
+            .build();
+
+        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        assert!(response.is_parent_group);
+        assert!(response.allow_non_admin_sub_group_creation);
+        assert!(response.parent_group_jid.is_none());
+        assert!(!response.is_default_sub_group);
+        assert!(!response.is_general_chat);
+    }
+
+    #[test]
+    fn test_group_info_response_parses_subgroup_fields() {
+        let parent_jid = "120363000000000001@g.us";
+        let node = NodeBuilder::new("group")
+            .attr("id", "120363000000000002@g.us")
+            .attr("subject", "Sub Group")
+            .children([
+                NodeBuilder::new("linked_parent")
+                    .attr("jid", parent_jid)
+                    .build(),
+                NodeBuilder::new("default_sub_group").build(),
+            ])
+            .build();
+
+        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        assert!(!response.is_parent_group);
+        assert!(response.is_default_sub_group);
+        assert_eq!(response.parent_group_jid, Some(parent_jid.parse().unwrap()));
     }
 }

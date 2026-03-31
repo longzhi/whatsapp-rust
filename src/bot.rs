@@ -1,3 +1,4 @@
+use crate::cache_config::CacheConfig;
 use crate::client::Client;
 use crate::pair_code::PairCodeOptions;
 use crate::store::commands::DeviceCommand;
@@ -10,11 +11,23 @@ use anyhow::Result;
 use log::{info, warn};
 use std::collections::HashMap;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio::task;
+use thiserror::Error;
+use wacore::runtime::Runtime;
 use waproto::whatsapp as wa;
+
+/// Typestate marker: a required builder field has not been provided yet.
+pub struct Missing;
+/// Typestate marker: a required builder field has been provided.
+pub struct Provided;
+
+#[derive(Debug, Error)]
+pub enum BotBuilderError {
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
 
 pub struct MessageContext {
     pub message: Box<wa::Message>,
@@ -23,7 +36,10 @@ pub struct MessageContext {
 }
 
 impl MessageContext {
-    pub async fn send_message(&self, message: wa::Message) -> Result<String, anyhow::Error> {
+    pub async fn send_message(
+        &self,
+        message: wa::Message,
+    ) -> Result<crate::send::SendResult, anyhow::Error> {
         self.client
             .send_message(self.info.source.chat.clone(), message)
             .await
@@ -89,16 +105,44 @@ impl EventHandler for BotEventHandler {
             let event_clone = event.clone();
             let client_clone = self.client.clone();
 
-            tokio::spawn(async move {
-                handler_clone(event_clone, client_clone).await;
-            });
+            self.client
+                .runtime
+                .spawn(Box::pin(async move {
+                    handler_clone(event_clone, client_clone).await;
+                }))
+                .detach();
         }
+    }
+}
+
+/// Handle returned by [`Bot::run`] that can be awaited to wait for the
+/// client's run loop to finish.
+pub struct BotHandle {
+    done_rx: futures::channel::oneshot::Receiver<()>,
+    _abort_handle: wacore::runtime::AbortHandle,
+}
+
+impl BotHandle {
+    /// Abort the bot's run task.
+    pub fn abort(&self) {
+        self._abort_handle.abort();
+    }
+}
+
+impl std::future::Future for BotHandle {
+    type Output = Result<(), futures::channel::oneshot::Canceled>;
+
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        Pin::new(&mut self.done_rx).poll(cx)
     }
 }
 
 pub struct Bot {
     client: Arc<Client>,
-    sync_task_receiver: Option<mpsc::Receiver<crate::sync_task::MajorSyncTask>>,
+    sync_task_receiver: Option<async_channel::Receiver<crate::sync_task::MajorSyncTask>>,
     event_handler: Option<EventHandlerCallback>,
     pair_code_options: Option<PairCodeOptions>,
 }
@@ -115,7 +159,7 @@ impl std::fmt::Debug for Bot {
 }
 
 impl Bot {
-    pub fn builder() -> BotBuilder {
+    pub fn builder() -> BotBuilder<Missing, Missing, Missing, Missing> {
         BotBuilder::new()
     }
 
@@ -123,32 +167,22 @@ impl Bot {
         self.client.clone()
     }
 
-    pub async fn run(&mut self) -> Result<task::JoinHandle<()>> {
-        if let Some(mut receiver) = self.sync_task_receiver.take() {
-            let worker_client = self.client.clone();
-            tokio::spawn(async move {
-                while let Some(task) = receiver.recv().await {
-                    match task {
-                        crate::sync_task::MajorSyncTask::HistorySync {
-                            message_id,
-                            notification,
-                        } => {
-                            worker_client
-                                .process_history_sync_task(message_id, *notification)
-                                .await;
-                        }
-                        crate::sync_task::MajorSyncTask::AppStateSync { name, full_sync } => {
-                            if let Err(e) = worker_client
-                                .process_app_state_sync_task(name, full_sync)
-                                .await
-                            {
-                                warn!("App state sync task for {:?} failed: {}", name, e);
-                            }
-                        }
+    pub async fn run(&mut self) -> Result<BotHandle> {
+        if let Some(receiver) = self.sync_task_receiver.take() {
+            let worker_client = Arc::downgrade(&self.client);
+            self.client
+                .runtime
+                .spawn(Box::pin(async move {
+                    while let Ok(task) = receiver.recv().await {
+                        let Some(worker_client) = worker_client.upgrade() else {
+                            break;
+                        };
+
+                        worker_client.process_sync_task(task).await;
                     }
-                }
-                info!("Sync worker shutting down.");
-            });
+                    info!("Sync worker shutting down.");
+                }))
+                .detach();
         }
 
         let handler = Arc::new(BotEventHandler {
@@ -160,7 +194,7 @@ impl Bot {
         // If pair code options are set, spawn a task to request pair code after socket is ready
         if let Some(options) = self.pair_code_options.take() {
             let client_for_pair = self.client.clone();
-            tokio::spawn(async move {
+            self.client.runtime.spawn(Box::pin(async move {
                 // Wait for socket to be ready (before login) with 30 second timeout
                 if let Err(e) = client_for_pair
                     .wait_for_socket(std::time::Duration::from_secs(30))
@@ -185,25 +219,38 @@ impl Bot {
                         warn!(target: "Bot/PairCode", "Failed to request pair code: {}", e);
                     }
                 }
-            });
+            })).detach();
         }
 
         let client_for_run = self.client.clone();
-        let client_handle = tokio::spawn(async move {
+        let (done_tx, done_rx) = futures::channel::oneshot::channel::<()>();
+        let abort_handle = self.client.runtime.spawn(Box::pin(async move {
             client_for_run.run().await;
-        });
+            let _ = done_tx.send(());
+        }));
 
-        Ok(client_handle)
+        Ok(BotHandle {
+            done_rx,
+            _abort_handle: abort_handle,
+        })
     }
 }
 
-pub struct BotBuilder {
-    event_handler: Option<EventHandlerCallback>,
-    custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
-    // The only way to configure storage
+/// Builder for [`Bot`] using the typestate pattern.
+///
+/// The four type parameters (`B`, `T`, `H`, `R`) track whether the required
+/// fields (backend, transport_factory, http_client, runtime) have been
+/// provided. The `build()` method is only available when all four are
+/// [`Provided`], turning missing-field errors into compile-time errors.
+pub struct BotBuilder<B = Missing, T = Missing, H = Missing, R = Missing> {
+    // Required fields (guaranteed present when B/T/H/R = Provided)
     backend: Option<Arc<dyn Backend>>,
     transport_factory: Option<Arc<dyn crate::transport::TransportFactory>>,
     http_client: Option<Arc<dyn crate::http::HttpClient>>,
+    runtime: Option<Arc<dyn Runtime>>,
+    // Optional fields
+    event_handler: Option<EventHandlerCallback>,
+    custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
     override_version: Option<(u32, u32, u32)>,
     os_info: Option<(
         Option<String>,
@@ -212,23 +259,170 @@ pub struct BotBuilder {
     )>,
     pair_code_options: Option<PairCodeOptions>,
     skip_history_sync: bool,
+    initial_push_name: Option<String>,
+    cache_config: CacheConfig,
+    _marker: PhantomData<(B, T, H, R)>,
 }
 
-impl BotBuilder {
+impl BotBuilder<Missing, Missing, Missing, Missing> {
     fn new() -> Self {
         Self {
-            event_handler: None,
-            custom_enc_handlers: HashMap::new(),
             backend: None,
             transport_factory: None,
             http_client: None,
+            runtime: None,
+            event_handler: None,
+            custom_enc_handlers: HashMap::new(),
             override_version: None,
             os_info: None,
             pair_code_options: None,
             skip_history_sync: false,
+            initial_push_name: None,
+            cache_config: CacheConfig::default(),
+            _marker: PhantomData,
         }
     }
+}
 
+// ── Required-field setters (each transitions one type parameter) ──────────
+
+impl<T, H, R> BotBuilder<Missing, T, H, R> {
+    /// Use a backend implementation for storage.
+    /// This is the only way to configure storage - there are no defaults.
+    ///
+    /// # Arguments
+    /// * `backend` - The backend implementation that provides all storage operations
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let backend = Arc::new(SqliteStore::new("whatsapp.db").await?);
+    /// let bot = Bot::builder()
+    ///     .with_backend(backend)
+    ///     .build()
+    ///     .await?;
+    /// ```
+    pub fn with_backend(self, backend: Arc<dyn Backend>) -> BotBuilder<Provided, T, H, R> {
+        BotBuilder {
+            backend: Some(backend),
+            transport_factory: self.transport_factory,
+            http_client: self.http_client,
+            runtime: self.runtime,
+            event_handler: self.event_handler,
+            custom_enc_handlers: self.custom_enc_handlers,
+            override_version: self.override_version,
+            os_info: self.os_info,
+            pair_code_options: self.pair_code_options,
+            skip_history_sync: self.skip_history_sync,
+            initial_push_name: self.initial_push_name,
+            cache_config: self.cache_config,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<B, H, R> BotBuilder<B, Missing, H, R> {
+    /// Set the transport factory for creating network connections.
+    /// This is required to build a bot.
+    ///
+    /// # Arguments
+    /// * `factory` - The transport factory implementation
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
+    ///
+    /// let bot = Bot::builder()
+    ///     .with_backend(backend)
+    ///     .with_transport_factory(TokioWebSocketTransportFactory::new())
+    ///     .build()
+    ///     .await?;
+    /// ```
+    pub fn with_transport_factory<F>(self, factory: F) -> BotBuilder<B, Provided, H, R>
+    where
+        F: crate::transport::TransportFactory + 'static,
+    {
+        BotBuilder {
+            backend: self.backend,
+            transport_factory: Some(Arc::new(factory)),
+            http_client: self.http_client,
+            runtime: self.runtime,
+            event_handler: self.event_handler,
+            custom_enc_handlers: self.custom_enc_handlers,
+            override_version: self.override_version,
+            os_info: self.os_info,
+            pair_code_options: self.pair_code_options,
+            skip_history_sync: self.skip_history_sync,
+            initial_push_name: self.initial_push_name,
+            cache_config: self.cache_config,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<B, T, R> BotBuilder<B, T, Missing, R> {
+    /// Configure the HTTP client used for media operations and version fetching.
+    ///
+    /// # Arguments
+    /// * `client` - The HTTP client implementation
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// use whatsapp_rust_ureq_http_client::UreqHttpClient;
+    ///
+    /// let bot = Bot::builder()
+    ///     .with_backend(backend)
+    ///     .with_http_client(UreqHttpClient::new())
+    ///     .build()
+    ///     .await?;
+    /// ```
+    pub fn with_http_client<C>(self, client: C) -> BotBuilder<B, T, Provided, R>
+    where
+        C: crate::http::HttpClient + 'static,
+    {
+        BotBuilder {
+            backend: self.backend,
+            transport_factory: self.transport_factory,
+            http_client: Some(Arc::new(client)),
+            runtime: self.runtime,
+            event_handler: self.event_handler,
+            custom_enc_handlers: self.custom_enc_handlers,
+            override_version: self.override_version,
+            os_info: self.os_info,
+            pair_code_options: self.pair_code_options,
+            skip_history_sync: self.skip_history_sync,
+            initial_push_name: self.initial_push_name,
+            cache_config: self.cache_config,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<B, T, H> BotBuilder<B, T, H, Missing> {
+    /// Set the async runtime implementation to use.
+    ///
+    /// This is required to build a bot.
+    pub fn with_runtime<Rt: Runtime>(self, runtime: Rt) -> BotBuilder<B, T, H, Provided> {
+        BotBuilder {
+            backend: self.backend,
+            transport_factory: self.transport_factory,
+            http_client: self.http_client,
+            runtime: Some(Arc::new(runtime)),
+            event_handler: self.event_handler,
+            custom_enc_handlers: self.custom_enc_handlers,
+            override_version: self.override_version,
+            os_info: self.os_info,
+            pair_code_options: self.pair_code_options,
+            skip_history_sync: self.skip_history_sync,
+            initial_push_name: self.initial_push_name,
+            cache_config: self.cache_config,
+            _marker: PhantomData,
+        }
+    }
+}
+
+// ── Optional-field setters (available in any state) ──────────────────────
+
+impl<B, T, H, R> BotBuilder<B, T, H, R> {
     pub fn on_event<F, Fut>(mut self, handler: F) -> Self
     where
         F: Fn(Event, Arc<Client>) -> Fut + Send + Sync + 'static,
@@ -248,78 +442,12 @@ impl BotBuilder {
     ///
     /// # Returns
     /// The updated BotBuilder
-    pub fn with_enc_handler<H>(mut self, enc_type: impl Into<String>, handler: H) -> Self
+    pub fn with_enc_handler<Eh>(mut self, enc_type: impl Into<String>, handler: Eh) -> Self
     where
-        H: EncHandler + 'static,
+        Eh: EncHandler + 'static,
     {
         self.custom_enc_handlers
             .insert(enc_type.into(), Arc::new(handler));
-        self
-    }
-
-    /// Use a backend implementation for storage.
-    /// This is the only way to configure storage - there are no defaults.
-    ///
-    /// # Arguments
-    /// * `backend` - The backend implementation that provides all storage operations
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// let backend = Arc::new(SqliteStore::new("whatsapp.db").await?);
-    /// let bot = Bot::builder()
-    ///     .with_backend(backend)
-    ///     .build()
-    ///     .await?;
-    /// ```
-    pub fn with_backend(mut self, backend: Arc<dyn Backend>) -> Self {
-        self.backend = Some(backend);
-        self
-    }
-
-    /// Set the transport factory for creating network connections.
-    /// This is required to build a bot.
-    ///
-    /// # Arguments
-    /// * `factory` - The transport factory implementation
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
-    ///
-    /// let bot = Bot::builder()
-    ///     .with_backend(backend)
-    ///     .with_transport_factory(TokioWebSocketTransportFactory::new())
-    ///     .build()
-    ///     .await?;
-    /// ```
-    pub fn with_transport_factory<F>(mut self, factory: F) -> Self
-    where
-        F: crate::transport::TransportFactory + 'static,
-    {
-        self.transport_factory = Some(Arc::new(factory));
-        self
-    }
-
-    /// Configure the HTTP client used for media operations and version fetching.
-    ///
-    /// # Arguments
-    /// * `client` - The HTTP client implementation
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// use whatsapp_rust_ureq_http_client::UreqHttpClient;
-    ///
-    /// let bot = Bot::builder()
-    ///     .with_backend(backend)
-    ///     .with_http_client(UreqHttpClient::new())
-    ///     .build()
-    ///     .await?;
-    /// ```
-    pub fn with_http_client<C>(mut self, client: C) -> Self
-    where
-        C: crate::http::HttpClient + 'static,
-    {
-        self.http_client = Some(Arc::new(client));
         self
     }
 
@@ -462,22 +590,57 @@ impl BotBuilder {
         self
     }
 
-    pub async fn build(self) -> Result<Bot> {
-        let backend = self.backend.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Backend is required. Use with_backend() to set a storage implementation."
-            )
-        })?;
+    /// Set an initial push name on the device before connecting.
+    ///
+    /// This is included in the `ClientPayload` during registration, allowing the
+    /// mock server to deterministically assign phone numbers based on push name
+    /// (same push name = same phone, enabling multi-device testing).
+    pub fn with_push_name(mut self, name: impl Into<String>) -> Self {
+        self.initial_push_name = Some(name.into());
+        self
+    }
 
-        let transport_factory = self.transport_factory.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Transport factory is required. Use with_transport_factory() to set one."
-            )
-        })?;
+    /// Configure cache TTL and capacity settings.
+    ///
+    /// By default, all caches match WhatsApp Web behavior. Use this method
+    /// to customize cache durations for your use case.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// use whatsapp_rust::{CacheConfig, CacheEntryConfig};
+    ///
+    /// // Disable TTL for group and device caches (good for bots with few groups)
+    /// let bot = Bot::builder()
+    ///     .with_backend(backend)
+    ///     .with_transport_factory(transport)
+    ///     .with_http_client(http_client)
+    ///     .with_cache_config(CacheConfig {
+    ///         group_cache: CacheEntryConfig::new(None, 1_000),
+    ///         device_registry_cache: CacheEntryConfig::new(None, 5_000),
+    ///         ..Default::default()
+    ///     })
+    ///     .build()
+    ///     .await?;
+    /// ```
+    pub fn with_cache_config(mut self, config: CacheConfig) -> Self {
+        self.cache_config = config;
+        self
+    }
+}
 
-        let http_client = self.http_client.ok_or_else(|| {
-            anyhow::anyhow!("HTTP client is required. Use with_http_client() to provide one.")
-        })?;
+// ── build() — only available when all 4 required fields are Provided ─────
+
+impl BotBuilder<Provided, Provided, Provided, Provided> {
+    pub async fn build(self) -> std::result::Result<Bot, BotBuilderError> {
+        // Destructure to extract required fields — typestate guarantees all are Some.
+        let (Some(runtime), Some(backend), Some(transport_factory), Some(http_client)) = (
+            self.runtime,
+            self.backend,
+            self.transport_factory,
+            self.http_client,
+        ) else {
+            unreachable!("typestate guarantees all required fields are Provided")
+        };
 
         // Note: For multi-account mode, create the backend with SqliteStore::new_for_device()
         // before passing it to with_backend()
@@ -489,7 +652,14 @@ impl BotBuilder {
 
         persistence_manager
             .clone()
-            .run_background_saver(std::time::Duration::from_secs(30));
+            .run_background_saver(runtime.clone(), std::time::Duration::from_secs(30));
+
+        // Apply initial push name if specified (for deterministic mock server phone assignment)
+        if let Some(name) = self.initial_push_name {
+            persistence_manager
+                .process_command(DeviceCommand::SetPushName(name))
+                .await;
+        }
 
         // Apply device props override if specified
         if let Some((os_name, version, platform_type)) = self.os_info {
@@ -507,17 +677,23 @@ impl BotBuilder {
         }
 
         info!("Creating client...");
-        let (client, sync_task_receiver) = Client::new(
+        let (client, sync_task_receiver) = Client::new_with_cache_config(
+            runtime,
             persistence_manager.clone(),
             transport_factory,
             http_client,
             self.override_version,
+            self.cache_config,
         )
         .await;
 
         // Register custom enc handlers
         for (enc_type, handler) in self.custom_enc_handlers {
-            client.custom_enc_handlers.insert(enc_type, handler);
+            client
+                .custom_enc_handlers
+                .write()
+                .await
+                .insert(enc_type, handler);
         }
 
         if self.skip_history_sync {
@@ -536,6 +712,7 @@ impl BotBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TokioRuntime;
     use crate::http::{HttpClient, HttpRequest, HttpResponse};
     use crate::store::SqliteStore;
     use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
@@ -589,6 +766,7 @@ mod tests {
             .with_backend(backend)
             .with_transport_factory(transport)
             .with_http_client(http_client)
+            .with_runtime(TokioRuntime)
             .build()
             .await
             .expect("Failed to build bot");
@@ -607,6 +785,7 @@ mod tests {
             .with_backend(backend)
             .with_transport_factory(transport)
             .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
             .build()
             .await
             .expect("Failed to build bot");
@@ -625,6 +804,7 @@ mod tests {
             .with_backend(backend)
             .with_transport_factory(transport)
             .with_http_client(http_client)
+            .with_runtime(TokioRuntime)
             .build()
             .await
             .expect("Failed to build bot with custom backend");
@@ -645,6 +825,7 @@ mod tests {
             .with_backend(backend)
             .with_http_client(http_client)
             .with_transport_factory(transport)
+            .with_runtime(TokioRuntime)
             .build()
             .await
             .expect("Failed to build bot with custom backend for specific device");
@@ -653,47 +834,10 @@ mod tests {
         let _client = bot.client();
     }
 
-    #[tokio::test]
-    async fn test_bot_builder_missing_backend() {
-        // Try to build without setting a backend
-        let transport = TokioWebSocketTransportFactory::new();
-        let http_client = MockHttpClient;
-        let result = Bot::builder()
-            .with_transport_factory(transport)
-            .with_http_client(http_client)
-            .build()
-            .await;
-
-        // This should fail
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Backend is required")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_bot_builder_missing_transport() {
-        // Try to build without setting a transport
-        let backend = create_test_sqlite_backend().await;
-        let http_client = MockHttpClient;
-        let result = Bot::builder()
-            .with_backend(backend)
-            .with_http_client(http_client)
-            .build()
-            .await;
-
-        // This should fail
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Transport factory is required")
-        );
-    }
+    // NOTE: test_bot_builder_missing_backend, test_bot_builder_missing_transport,
+    // and test_bot_builder_missing_http_client have been removed because the
+    // typestate pattern now makes those cases compile-time errors instead of
+    // runtime errors.
 
     #[tokio::test]
     async fn test_bot_builder_with_version_override() {
@@ -706,6 +850,7 @@ mod tests {
             .with_transport_factory(transport)
             .with_http_client(http_client)
             .with_version((2, 3000, 123456789))
+            .with_runtime(TokioRuntime)
             .build()
             .await
             .expect("Failed to build bot with version override");
@@ -736,6 +881,7 @@ mod tests {
             .with_transport_factory(transport)
             .with_http_client(http_client)
             .with_device_props(Some(custom_os.clone()), Some(custom_version), None)
+            .with_runtime(TokioRuntime)
             .build()
             .await
             .expect("Failed to build bot with device props override");
@@ -762,6 +908,7 @@ mod tests {
             .with_transport_factory(transport)
             .with_http_client(http_client)
             .with_device_props(Some(custom_os.clone()), None, None)
+            .with_runtime(TokioRuntime)
             .build()
             .await
             .expect("Failed to build bot with OS only override");
@@ -797,6 +944,7 @@ mod tests {
             .with_http_client(http_client)
             .with_transport_factory(transport)
             .with_device_props(None, Some(custom_version), None)
+            .with_runtime(TokioRuntime)
             .build()
             .await
             .expect("Failed to build bot with version only override");
@@ -825,6 +973,7 @@ mod tests {
             .with_transport_factory(transport)
             .with_http_client(http_client)
             .with_device_props(None, None, Some(wa::device_props::PlatformType::Chrome))
+            .with_runtime(TokioRuntime)
             .build()
             .await
             .expect("Failed to build bot with platform type override");
@@ -873,6 +1022,7 @@ mod tests {
                 Some(custom_version),
                 Some(custom_platform),
             )
+            .with_runtime(TokioRuntime)
             .build()
             .await
             .expect("Failed to build bot with full device props override");
@@ -901,6 +1051,7 @@ mod tests {
             .with_transport_factory(transport)
             .with_http_client(http_client)
             .skip_history_sync()
+            .with_runtime(TokioRuntime)
             .build()
             .await
             .expect("Failed to build bot with skip_history_sync");
@@ -918,6 +1069,7 @@ mod tests {
             .with_backend(backend)
             .with_transport_factory(transport)
             .with_http_client(http_client)
+            .with_runtime(TokioRuntime)
             .build()
             .await
             .expect("Failed to build bot");

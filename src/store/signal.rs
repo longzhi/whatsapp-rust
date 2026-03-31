@@ -1,7 +1,7 @@
 use crate::store::Device;
+use async_lock::Mutex;
 use async_trait::async_trait;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use wacore::libsignal::protocol::error::Result as SignalResult;
 use wacore::libsignal::protocol::{
     Direction, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore, PrivateKey,
@@ -16,7 +16,8 @@ type StoreError = Box<dyn std::error::Error + Send + Sync>;
 
 macro_rules! impl_store_wrapper {
     ($wrapper_ty:ty, $read_lock:ident, $write_lock:ident) => {
-        #[async_trait]
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl IdentityKeyStore for $wrapper_ty {
             async fn get_identity_key_pair(&self) -> SignalResult<IdentityKeyPair> {
                 self.0.$read_lock().await.get_identity_key_pair().await
@@ -59,7 +60,8 @@ macro_rules! impl_store_wrapper {
             }
         }
 
-        #[async_trait]
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl PreKeyStore for $wrapper_ty {
             async fn load_prekey(
                 &self,
@@ -90,7 +92,8 @@ macro_rules! impl_store_wrapper {
             }
         }
 
-        #[async_trait]
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl SignedPreKeyStore for $wrapper_ty {
             async fn load_signed_prekey(
                 &self,
@@ -141,7 +144,8 @@ macro_rules! impl_store_wrapper {
             }
         }
 
-        #[async_trait]
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl SessionStore for $wrapper_ty {
             async fn load_session(
                 &self,
@@ -188,7 +192,8 @@ macro_rules! impl_store_wrapper {
     };
 }
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl IdentityKeyStore for Device {
     async fn get_identity_key_pair(&self) -> SignalResult<IdentityKeyPair> {
         Ok(self.identity_key.clone().into())
@@ -203,13 +208,13 @@ impl IdentityKeyStore for Device {
         address: &ProtocolAddress,
         identity_key: &IdentityKey,
     ) -> SignalResult<IdentityChange> {
-        let address_str = address.to_string();
+        let address_str = address.as_str();
         let key_bytes = identity_key.public_key().public_key_bytes();
         let existing_identity_opt = self.get_identity(address).await?;
 
         self.backend
             .put_identity(
-                &address_str,
+                address_str,
                 key_bytes.try_into().map_err(|_| {
                     SignalProtocolError::InvalidArgument("Invalid key length".into())
                 })?,
@@ -243,7 +248,7 @@ impl IdentityKeyStore for Device {
     async fn get_identity(&self, address: &ProtocolAddress) -> SignalResult<Option<IdentityKey>> {
         let identity_bytes = self
             .backend
-            .load_identity(&address.to_string())
+            .load_identity(address.as_str())
             .await
             .map_err(|e| {
                 SignalProtocolError::InvalidState("backend get_identity", e.to_string())
@@ -259,7 +264,8 @@ impl IdentityKeyStore for Device {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl PreKeyStore for Device {
     async fn load_prekey(
         &self,
@@ -323,7 +329,8 @@ impl PreKeyStore for Device {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl SignedPreKeyStore for Device {
     async fn load_signed_prekey(
         &self,
@@ -334,7 +341,7 @@ impl SignedPreKeyStore for Device {
                 self.signed_pre_key_id,
                 &self.signed_pre_key,
                 self.signed_pre_key_signature,
-                chrono::Utc::now(),
+                wacore::time::now_utc(),
             );
             return Ok(Some(record));
         }
@@ -373,11 +380,12 @@ impl SignedPreKeyStore for Device {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl SessionStore for Device {
     async fn load_session(&self, address: &ProtocolAddress) -> Result<SessionRecord, StoreError> {
-        let address_str = address.to_string();
-        match self.backend.get_session(&address_str).await {
+        let address_str = address.as_str();
+        match self.backend.get_session(address_str).await {
             Ok(Some(session_data)) => {
                 SessionRecord::deserialize(&session_data).map_err(|e| Box::new(e) as StoreError)
             }
@@ -396,27 +404,27 @@ impl SessionStore for Device {
         address: &ProtocolAddress,
         record: &SessionRecord,
     ) -> Result<(), StoreError> {
-        let address_str = address.to_string();
+        let address_str = address.as_str();
         let session_data = record.serialize().map_err(|e| Box::new(e) as StoreError)?;
 
         self.backend
-            .put_session(&address_str, &session_data)
+            .put_session(address_str, &session_data)
             .await
             .map_err(|e| Box::new(e) as StoreError)
     }
 
     async fn contains_session(&self, address: &ProtocolAddress) -> Result<bool, StoreError> {
-        let address_str = address.to_string();
+        let address_str = address.as_str();
         self.backend
-            .has_session(&address_str)
+            .has_session(address_str)
             .await
             .map_err(|e| Box::new(e) as StoreError)
     }
 
     async fn delete_session(&self, address: &ProtocolAddress) -> Result<(), StoreError> {
-        let address_str = address.to_string();
+        let address_str = address.as_str();
         self.backend
-            .delete_session(&address_str)
+            .delete_session(address_str)
             .await
             .map_err(|e| Box::new(e) as StoreError)
     }
@@ -427,7 +435,7 @@ impl SessionStore for Device {
     }
 }
 
-use tokio::sync::RwLock;
+use async_lock::RwLock;
 
 pub struct DeviceRwLockWrapper(pub Arc<RwLock<Device>>);
 
@@ -461,21 +469,17 @@ impl Clone for DeviceStore {
 
 impl_store_wrapper!(DeviceStore, lock, lock);
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl SenderKeyStore for Device {
     async fn store_sender_key(
         &mut self,
         sender_key_name: &SenderKeyName,
-        record: &SenderKeyRecord,
+        record: SenderKeyRecord,
     ) -> SignalResult<()> {
-        let unique_key = format!(
-            "{}:{}",
-            sender_key_name.group_id(),
-            sender_key_name.sender_id()
-        );
         let serialized_record = record.serialize()?;
         self.backend
-            .put_sender_key(&unique_key, &serialized_record)
+            .put_sender_key(sender_key_name.cache_key(), &serialized_record)
             .await
             .map_err(|e| SignalProtocolError::InvalidState("store_sender_key", e.to_string()))
     }
@@ -484,14 +488,9 @@ impl SenderKeyStore for Device {
         &mut self,
         sender_key_name: &SenderKeyName,
     ) -> SignalResult<Option<SenderKeyRecord>> {
-        let unique_key = format!(
-            "{}:{}",
-            sender_key_name.group_id(),
-            sender_key_name.sender_id()
-        );
         match self
             .backend
-            .get_sender_key(&unique_key)
+            .get_sender_key(sender_key_name.cache_key())
             .await
             .map_err(|e| SignalProtocolError::InvalidState("load_sender_key", e.to_string()))?
         {

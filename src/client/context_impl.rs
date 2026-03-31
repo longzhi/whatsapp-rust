@@ -2,10 +2,12 @@ use crate::client::Client;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use wacore::client::context::{GroupInfo, SendContextResolver};
+use wacore::iq::prekeys::PreKeyFetchReason;
 use wacore::libsignal::protocol::PreKeyBundle;
 use wacore_binary::jid::Jid;
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl SendContextResolver for Client {
     async fn resolve_devices(&self, jids: &[Jid]) -> Result<Vec<Jid>, anyhow::Error> {
         self.get_user_devices(jids).await
@@ -22,7 +24,8 @@ impl SendContextResolver for Client {
         &self,
         jids: &[Jid],
     ) -> Result<HashMap<Jid, PreKeyBundle>, anyhow::Error> {
-        self.fetch_pre_keys(jids, Some("identity")).await
+        self.fetch_pre_keys(jids, Some(PreKeyFetchReason::Identity))
+            .await
     }
 
     async fn resolve_group_info(&self, jid: &Jid) -> Result<GroupInfo, anyhow::Error> {

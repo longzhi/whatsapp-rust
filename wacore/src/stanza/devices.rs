@@ -126,12 +126,12 @@ impl ProtocolNode for DeviceElement {
     }
 
     fn into_node(self) -> Node {
-        let mut builder = NodeBuilder::new("device").attr("jid", self.jid.to_string());
+        let mut builder = NodeBuilder::new("device").attr("jid", self.jid);
         if let Some(ki) = self.key_index {
             builder = builder.attr("key-index", ki.to_string());
         }
         if let Some(lid) = self.lid {
-            builder = builder.attr("lid", lid.to_string());
+            builder = builder.attr("lid", lid);
         }
         builder.build()
     }
@@ -218,7 +218,7 @@ impl DeviceOperation {
     /// - `key-index-list` is REQUIRED for add/remove operations
     /// - `ts` attribute is REQUIRED for remove operations
     pub fn try_from_child(node: &Node) -> Result<Self> {
-        let operation_type = DeviceNotificationType::try_from(node.tag.as_str())
+        let operation_type = DeviceNotificationType::try_from(node.tag.as_ref())
             .map_err(|_| anyhow!("unknown device operation: {}", node.tag))?;
 
         match operation_type {
@@ -307,7 +307,7 @@ impl DeviceNotification {
         if node.tag != "notification" {
             return Err(anyhow!("expected <notification>, got <{}>", node.tag));
         }
-        if optional_attr(node, "type") != Some("devices") {
+        if !node.attrs.get("type").is_some_and(|v| v == "devices") {
             return Err(anyhow!("expected type='devices'"));
         }
 
@@ -317,7 +317,7 @@ impl DeviceNotification {
             .ok_or_else(|| anyhow!("notification missing required 'from' attribute"))?;
         let lid_user = node.attrs().optional_jid("lid");
         let stanza_id = optional_attr(node, "id")
-            .map(String::from)
+            .map(|s| s.into_owned())
             .unwrap_or_default();
 
         // Parse timestamp with checked conversion

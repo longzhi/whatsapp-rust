@@ -37,7 +37,7 @@
 //! </iq>
 //! ```
 
-use crate::iq::node::{required_attr, required_child};
+use crate::iq::node::required_child;
 use crate::iq::spec::IqSpec;
 use crate::prekeys::PreKeyUtils;
 use crate::protocol::ProtocolNode;
@@ -49,6 +49,29 @@ use wacore_binary::node::{Node, NodeContent};
 
 // Re-export PreKeyBundle for convenience
 pub use crate::libsignal::protocol::{PreKeyBundle, PublicKey};
+
+/// Extract binary content from an optional node as `Vec<u8>`.
+fn extract_content_bytes(node: Option<&Node>) -> Vec<u8> {
+    node.and_then(|n| match &n.content {
+        Some(NodeContent::Bytes(b)) => Some(b.clone()),
+        _ => None,
+    })
+    .unwrap_or_default()
+}
+
+/// Extract binary content from an optional node as a big-endian unsigned integer.
+fn extract_content_uint(node: Option<&Node>) -> u32 {
+    node.and_then(|n| match &n.content {
+        Some(NodeContent::Bytes(b)) => {
+            let mut buf = [0u8; 4];
+            let len = b.len().min(4);
+            buf[4 - len..].copy_from_slice(&b[..len]);
+            Some(u32::from_be_bytes(buf))
+        }
+        _ => None,
+    })
+    .unwrap_or(0)
+}
 
 /// Pre-key count response.
 #[derive(Debug, Clone)]
@@ -86,18 +109,29 @@ impl IqSpec for PreKeyCountSpec {
 
         // Server may return <count/> without value attribute when count is 0,
         // or return an unparseable value. Default to 0 in these cases.
-        let count_str = count_node.attrs().optional_string("value").unwrap_or("0");
+        let count_str = count_node.attrs().optional_string("value");
+        let count_str = count_str.as_deref().unwrap_or("0");
         let count = count_str.parse::<usize>().unwrap_or(0);
 
         Ok(PreKeyCountResponse { count })
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, crate::StringEnum)]
+pub enum PreKeyFetchReason {
+    #[str = "identity"]
+    Identity,
+    #[str = "retry"]
+    Retry,
+    #[string_fallback]
+    Other(String),
+}
+
 /// Fetches pre-key bundles for a list of JIDs.
 #[derive(Debug, Clone)]
 pub struct PreKeyFetchSpec {
     pub jids: Vec<Jid>,
-    pub reason: Option<String>,
+    pub reason: Option<PreKeyFetchReason>,
 }
 
 impl PreKeyFetchSpec {
@@ -105,10 +139,10 @@ impl PreKeyFetchSpec {
         Self { jids, reason: None }
     }
 
-    pub fn with_reason(jids: Vec<Jid>, reason: impl Into<String>) -> Self {
+    pub fn with_reason(jids: Vec<Jid>, reason: PreKeyFetchReason) -> Self {
         Self {
             jids,
-            reason: Some(reason.into()),
+            reason: Some(reason),
         }
     }
 }
@@ -117,7 +151,10 @@ impl IqSpec for PreKeyFetchSpec {
     type Response = std::collections::HashMap<Jid, PreKeyBundle>;
 
     fn build_iq(&self) -> InfoQuery<'static> {
-        let content = PreKeyUtils::build_fetch_prekeys_request(&self.jids, self.reason.as_deref());
+        let content = PreKeyUtils::build_fetch_prekeys_request(
+            &self.jids,
+            self.reason.as_ref().map(|r| r.as_str()),
+        );
 
         InfoQuery::get(
             "encrypt",
@@ -140,7 +177,21 @@ impl IqSpec for PreKeyFetchSpec {
 ///
 /// <!-- Response -->
 /// <iq from="s.whatsapp.net" id="..." type="result">
-///   <digest>[binary hash of server-side key bundle]</digest>
+///   <digest>
+///     <registration>[4-byte BE registration ID]</registration>
+///     <type>[1-byte: 5]</type>
+///     <identity>[32-byte identity public key]</identity>
+///     <skey>
+///       <id>[3-byte BE signed pre-key ID]</id>
+///       <value>[32-byte signed pre-key public]</value>
+///       <signature>[64-byte signature]</signature>
+///     </skey>
+///     <list>
+///       <id>[3-byte BE prekey ID]</id>
+///       ...
+///     </list>
+///     <hash>[20-byte SHA-1 hash]</hash>
+///   </digest>
 /// </iq>
 /// ```
 ///
@@ -158,10 +209,25 @@ impl DigestKeyBundleSpec {
 }
 
 /// Response from digest key bundle query.
+///
+/// Verified against WhatsApp Web JS `digestResponseParser` in WAWebDigestKeyJob.
+/// The server returns the full key bundle along with a SHA-1 hash for validation.
 #[derive(Debug, Clone)]
 pub struct DigestKeyBundleResponse {
-    /// The digest hash bytes from the server (20 bytes SHA-1 hash).
-    pub digest: Option<Vec<u8>>,
+    /// Registration ID (4-byte big-endian uint).
+    pub reg_id: u32,
+    /// Identity public key (32 bytes).
+    pub identity: Vec<u8>,
+    /// Signed pre-key ID (3-byte big-endian uint).
+    pub skey_id: u32,
+    /// Signed pre-key public key (32 bytes).
+    pub skey_pubkey: Vec<u8>,
+    /// Signed pre-key signature (64 bytes).
+    pub skey_signature: Vec<u8>,
+    /// List of pre-key IDs currently on the server (each 3-byte big-endian uint).
+    pub prekey_ids: Vec<u32>,
+    /// SHA-1 hash of the key bundle (20 bytes).
+    pub hash: Vec<u8>,
 }
 
 impl IqSpec for DigestKeyBundleSpec {
@@ -178,16 +244,60 @@ impl IqSpec for DigestKeyBundleSpec {
     }
 
     fn parse_response(&self, response: &Node) -> Result<Self::Response, anyhow::Error> {
-        let digest_node = response.get_optional_child("digest");
+        let digest_node = response
+            .get_optional_child("digest")
+            .ok_or_else(|| anyhow::anyhow!("missing <digest> child in response"))?;
 
-        let digest = digest_node.and_then(|node| {
-            node.content.as_ref().and_then(|content| match content {
-                NodeContent::Bytes(bytes) => Some(bytes.clone()),
-                _ => None,
+        // Required fields — error if missing node or empty content
+        let reg_node = required_child(digest_node, "registration")?;
+        let reg_id = extract_content_uint(Some(reg_node));
+
+        let identity_node = required_child(digest_node, "identity")?;
+        let identity = match &identity_node.content {
+            Some(NodeContent::Bytes(b)) if !b.is_empty() => b.clone(),
+            _ => return Err(anyhow!("missing or empty bytes in <identity>")),
+        };
+
+        let skey_node = digest_node.get_optional_child("skey");
+        let (skey_id, skey_pubkey, skey_signature) = if let Some(skey) = skey_node {
+            (
+                extract_content_uint(skey.get_optional_child("id")),
+                extract_content_bytes(skey.get_optional_child("value")),
+                extract_content_bytes(skey.get_optional_child("signature")),
+            )
+        } else {
+            (0, Vec::new(), Vec::new())
+        };
+
+        // Parse all children of <list> as 3-byte prekey IDs.
+        // Server sends them as <id> nodes (not <key>), matching WA Web's
+        // mapChildren which iterates all children without tag filtering.
+        let prekey_ids = digest_node
+            .get_optional_child("list")
+            .and_then(|list| list.children())
+            .map(|children| {
+                children
+                    .iter()
+                    .map(|child| extract_content_uint(Some(child)))
+                    .collect()
             })
-        });
+            .unwrap_or_default();
 
-        Ok(DigestKeyBundleResponse { digest })
+        let hash_node = required_child(digest_node, "hash")?;
+        let hash = match &hash_node.content {
+            Some(NodeContent::Bytes(b)) if !b.is_empty() => b.clone(),
+            _ => return Err(anyhow!("missing or empty bytes in <hash>")),
+        };
+
+        Ok(DigestKeyBundleResponse {
+            reg_id,
+            identity,
+            skey_id,
+            skey_pubkey,
+            skey_signature,
+            prekey_ids,
+            hash,
+        })
     }
 }
 
@@ -582,7 +692,7 @@ impl ProtocolNode for PreKeyBundleUserNode {
         }
 
         NodeBuilder::new("user")
-            .attr("jid", self.jid.to_string())
+            .attr("jid", self.jid)
             .attr("type", "result")
             .children(children)
             .build()
@@ -593,8 +703,10 @@ impl ProtocolNode for PreKeyBundleUserNode {
             return Err(anyhow!("expected <user>, got <{}>", node.tag));
         }
 
-        let jid_str = required_attr(node, "jid")?;
-        let jid = jid_str.parse()?;
+        let jid = node
+            .attrs()
+            .optional_jid("jid")
+            .ok_or_else(|| anyhow!("missing required attribute jid"))?;
 
         // Parse registration ID (4 bytes big-endian)
         let reg_node = required_child(node, "registration")?;
@@ -725,9 +837,9 @@ mod tests {
     #[test]
     fn test_prekey_fetch_spec_with_reason() {
         let jids = vec!["1234567890:0@s.whatsapp.net".parse().unwrap()];
-        let spec = PreKeyFetchSpec::with_reason(jids, "retry");
+        let spec = PreKeyFetchSpec::with_reason(jids, PreKeyFetchReason::Retry);
 
-        assert_eq!(spec.reason, Some("retry".to_string()));
+        assert_eq!(spec.reason, Some(PreKeyFetchReason::Retry));
     }
 
     #[test]
@@ -749,30 +861,53 @@ mod tests {
     #[test]
     fn test_digest_key_bundle_spec_parse_response() {
         let spec = DigestKeyBundleSpec::new();
-        let digest_bytes = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+        let hash_bytes = vec![0xAA; 20]; // SHA-1 hash
 
         let response = NodeBuilder::new("iq")
             .attr("type", "result")
             .children([NodeBuilder::new("digest")
-                .bytes(digest_bytes.clone())
+                .children([
+                    NodeBuilder::new("registration")
+                        .bytes(12345u32.to_be_bytes().to_vec())
+                        .build(),
+                    NodeBuilder::new("type").bytes(vec![5]).build(),
+                    NodeBuilder::new("identity").bytes(vec![0x01; 32]).build(),
+                    NodeBuilder::new("skey")
+                        .children([
+                            NodeBuilder::new("id").bytes(vec![0x00, 0x00, 0x01]).build(),
+                            NodeBuilder::new("value").bytes(vec![0x02; 32]).build(),
+                            NodeBuilder::new("signature").bytes(vec![0x03; 64]).build(),
+                        ])
+                        .build(),
+                    NodeBuilder::new("list")
+                        .children([
+                            NodeBuilder::new("id").bytes(vec![0x00, 0x00, 0x0A]).build(),
+                            NodeBuilder::new("id").bytes(vec![0x00, 0x00, 0x0B]).build(),
+                        ])
+                        .build(),
+                    NodeBuilder::new("hash").bytes(hash_bytes.clone()).build(),
+                ])
                 .build()])
             .build();
 
         let result = spec.parse_response(&response).unwrap();
-        assert_eq!(result.digest, Some(digest_bytes));
+        assert_eq!(result.reg_id, 12345);
+        assert_eq!(result.identity, vec![0x01; 32]);
+        assert_eq!(result.skey_id, 1);
+        assert_eq!(result.skey_pubkey, vec![0x02; 32]);
+        assert_eq!(result.skey_signature, vec![0x03; 64]);
+        assert_eq!(result.prekey_ids, vec![10, 11]);
+        assert_eq!(result.hash, hash_bytes);
     }
 
     #[test]
     fn test_digest_key_bundle_spec_parse_response_empty() {
         let spec = DigestKeyBundleSpec::new();
 
-        let response = NodeBuilder::new("iq")
-            .attr("type", "result")
-            .children([NodeBuilder::new("digest").build()])
-            .build();
+        let response = NodeBuilder::new("iq").attr("type", "result").build();
 
-        let result = spec.parse_response(&response).unwrap();
-        assert_eq!(result.digest, None);
+        // Missing <digest> child should error
+        assert!(spec.parse_response(&response).is_err());
     }
 
     #[test]
@@ -885,11 +1020,11 @@ mod tests {
         let node = user_node.into_node();
 
         assert_eq!(node.tag, "user");
+        assert_eq!(node.attrs().optional_jid("jid"), Some(jid));
         assert_eq!(
-            node.attrs().optional_string("jid"),
-            Some(jid.to_string().as_str())
+            node.attrs().optional_string("type").as_deref(),
+            Some("result")
         );
-        assert_eq!(node.attrs().optional_string("type"), Some("result"));
 
         // Verify children count (registration, type, identity, skey, key, device-identity)
         if let Some(children) = node.children() {

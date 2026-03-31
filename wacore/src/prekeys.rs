@@ -7,10 +7,31 @@ use wacore_binary::node::{Node, NodeContent};
 
 pub struct PreKeyUtils;
 
+/// Compute SHA-1 digest of a key bundle for validation against server.
+///
+/// Matches WA Web's `validateLocalKeyBundle` hash computation:
+/// SHA-1(identity_pub_key || signed_prekey_pub || signed_prekey_signature || prekey_pub_1 || prekey_pub_2 || ...)
+pub fn compute_key_bundle_digest(
+    identity_pub_key: &[u8],
+    signed_prekey_pub: &[u8],
+    signed_prekey_signature: &[u8],
+    prekey_pubkeys: &[Vec<u8>],
+) -> Vec<u8> {
+    use sha1::Digest;
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(identity_pub_key);
+    hasher.update(signed_prekey_pub);
+    hasher.update(signed_prekey_signature);
+    for pk in prekey_pubkeys {
+        hasher.update(pk);
+    }
+    hasher.finalize().to_vec()
+}
+
 impl PreKeyUtils {
     pub fn build_fetch_prekeys_request(jids: &[Jid], reason: Option<&str>) -> Node {
         let user_nodes = jids.iter().map(|jid| {
-            let mut user_builder = NodeBuilder::new("user").attr("jid", jid.to_string());
+            let mut user_builder = NodeBuilder::new("user").attr("jid", jid.clone());
             if let Some(r) = reason {
                 user_builder = user_builder.attr("reason", r);
             }
@@ -64,7 +85,7 @@ impl PreKeyUtils {
             NodeBuilder::new("registration")
                 .bytes(registration_id_bytes)
                 .build(),
-            NodeBuilder::new("type").bytes(type_bytes.clone()).build(),
+            NodeBuilder::new("type").bytes(type_bytes).build(),
             NodeBuilder::new("identity")
                 .bytes(identity_key_bytes)
                 .build(),
@@ -259,11 +280,12 @@ mod tests {
     use crate::iq::prekeys::PreKeyBundleUserNode;
     use crate::libsignal::protocol::{IdentityKeyPair, KeyPair};
     use crate::protocol::ProtocolNode;
-    use rand::TryRngCore;
+
+    use std::borrow::Cow;
     use wacore_binary::node::NodeValue;
 
     fn create_mock_bundle(device_id: u32) -> PreKeyBundle {
-        let mut rng = rand::rngs::OsRng.unwrap_err();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let identity_pair = IdentityKeyPair::generate(&mut rng);
         let signed_prekey_pair = KeyPair::generate(&mut rng);
         let prekey_pair = KeyPair::generate(&mut rng);
@@ -290,7 +312,7 @@ mod tests {
 
         let raw_jid = Jid {
             user: "100000012345678:33".to_string(),
-            server: "lid".to_string(),
+            server: Cow::Borrowed("lid"),
             agent: 1,
             device: 0,
             integrator: 0,

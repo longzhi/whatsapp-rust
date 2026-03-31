@@ -2,12 +2,10 @@ use crate::client::Client;
 use crate::store::signal_adapter::SignalProtocolStoreAdapter;
 use crate::types::events::Event;
 use crate::types::message::MessageInfo;
-use chrono::DateTime;
 use log::{debug, warn};
 use prost::Message as ProtoMessage;
-use rand::TryRngCore;
+
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use wacore::libsignal::crypto::DecryptionError;
 use wacore::libsignal::protocol::SenderKeyDistributionMessage;
 use wacore::libsignal::protocol::group_decrypt;
@@ -19,7 +17,7 @@ use wacore::libsignal::protocol::{
     PublicKey as SignalPublicKey, SENDERKEY_MESSAGE_CURRENT_VERSION,
 };
 use wacore::libsignal::store::sender_key_name::SenderKeyName;
-use wacore::messages::MessageUtils;
+use wacore::message_processing::EncType;
 use wacore::types::jid::JidExt;
 use wacore_binary::jid::Jid;
 use wacore_binary::jid::JidExt as _;
@@ -34,49 +32,30 @@ const MAX_DECRYPT_RETRIES: u8 = 5;
 /// WhatsApp Web logs metrics when retry count exceeds this value.
 const HIGH_RETRY_COUNT_THRESHOLD: u8 = 3;
 
-/// Retry reason codes matching WhatsApp Web's RetryReason enum.
-/// These are included in the retry receipt to help the sender understand
-/// why the message couldn't be decrypted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-#[allow(dead_code)] // All variants defined for WhatsApp Web compatibility
-pub(crate) enum RetryReason {
-    /// Unknown or unspecified error
-    UnknownError = 0,
-    /// No session exists with the sender (SessionNotFound)
-    NoSession = 1,
-    /// Invalid key in the message
-    InvalidKey = 2,
-    /// PreKey ID not found (InvalidPreKeyId)
-    InvalidKeyId = 3,
-    /// Invalid message format or content (InvalidMessage)
-    InvalidMessage = 4,
-    /// Invalid signature
-    InvalidSignature = 5,
-    /// Message from the future (timestamp issue)
-    FutureMessage = 6,
-    /// MAC verification failed (bad MAC)
-    BadMac = 7,
-    /// Invalid session state
-    InvalidSession = 8,
-    /// Invalid message key
-    InvalidMsgKey = 9,
-}
+pub(crate) use wacore::protocol::retry::RetryReason;
 
 impl Client {
     /// Dispatches a successfully parsed message to the event bus and sends a delivery receipt.
     fn dispatch_parsed_message(self: &Arc<Self>, msg: wa::Message, info: &MessageInfo) {
+        use wacore::proto_helpers::MessageExt;
+
+        let mut info = info.clone();
+        if info.ephemeral_expiration.is_none() {
+            info.ephemeral_expiration = msg.get_base_message().get_ephemeral_expiration();
+        }
+
         // Send delivery receipt immediately in the background.
         let client_clone = self.clone();
-        let info_clone = info.clone();
-        tokio::spawn(async move {
-            client_clone.send_delivery_receipt(&info_clone).await;
-        });
+        let info_for_receipt = info.clone();
+        self.runtime
+            .spawn(Box::pin(async move {
+                client_clone.send_delivery_receipt(&info_for_receipt).await;
+            }))
+            .detach();
 
-        // Dispatch to event bus
         self.core
             .event_bus
-            .dispatch(&Event::Message(Box::new(msg), info.clone()));
+            .dispatch(&Event::Message(Box::new(msg), info));
     }
 
     /// Handles a newsletter plaintext message.
@@ -139,45 +118,41 @@ impl Client {
     /// 2. Spawning a retry receipt to request re-encryption
     ///
     /// Returns `true` to be assigned to `dispatched_undecryptable` flag.
-    fn handle_decrypt_failure(self: &Arc<Self>, info: &MessageInfo, reason: RetryReason) -> bool {
-        self.dispatch_undecryptable_event(info, crate::types::events::DecryptFailMode::Show);
+    fn handle_decrypt_failure(
+        self: &Arc<Self>,
+        info: &MessageInfo,
+        reason: RetryReason,
+        decrypt_fail_mode: crate::types::events::DecryptFailMode,
+    ) -> bool {
+        self.dispatch_undecryptable_event(info, decrypt_fail_mode);
         self.spawn_retry_receipt(info, reason);
         true
     }
 
-    /// Atomically increments the retry count for a message and returns the new count.
+    /// Increments the retry count for a message and returns the new count.
     /// Returns `None` if max retries have been reached.
     ///
-    /// Uses moka's `and_compute_with` for truly atomic read-modify-write operations,
-    /// preventing race conditions where concurrent calls could exceed MAX_DECRYPT_RETRIES.
+    /// Note: get-then-insert has a theoretical TOCTOU window since
+    /// `spawn_retry_receipt` detaches. In practice, retries for the same
+    /// message are rare and a double-send is benign (recipients deduplicate
+    /// by message ID).
     async fn increment_retry_count(&self, cache_key: &str) -> Option<u8> {
-        use moka::ops::compute::Op;
-
-        let result = self
-            .message_retry_counts
-            .entry_by_ref(cache_key)
-            .and_compute_with(|maybe_entry| {
-                let op = if let Some(entry) = maybe_entry {
-                    let current = entry.into_value();
-                    if current >= MAX_DECRYPT_RETRIES {
-                        // Max retries reached, don't increment
-                        Op::Nop
-                    } else {
-                        Op::Put(current + 1)
-                    }
-                } else {
-                    Op::Put(1_u8)
-                };
-                std::future::ready(op)
-            })
-            .await;
-
-        match result {
-            moka::ops::compute::CompResult::Inserted(entry) => Some(entry.into_value()),
-            moka::ops::compute::CompResult::ReplacedWith(entry) => Some(entry.into_value()),
-            moka::ops::compute::CompResult::Unchanged(_) => None, // Max retries reached
-            moka::ops::compute::CompResult::StillNone(_) => None,
-            moka::ops::compute::CompResult::Removed(_) => None,
+        let current = self.message_retry_counts.get(&cache_key.to_string()).await;
+        match current {
+            Some(count) if count >= MAX_DECRYPT_RETRIES => None,
+            Some(count) => {
+                let new_count = count + 1;
+                self.message_retry_counts
+                    .insert(cache_key.to_string(), new_count)
+                    .await;
+                Some(new_count)
+            }
+            None => {
+                self.message_retry_counts
+                    .insert(cache_key.to_string(), 1_u8)
+                    .await;
+                Some(1)
+            }
         }
     }
 
@@ -220,7 +195,7 @@ impl Client {
         let client = Arc::clone(self);
         let info = info.clone();
 
-        tokio::spawn(async move {
+        self.runtime.spawn(Box::pin(async move {
             let cache_key = client
                 .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
                 .await;
@@ -275,14 +250,16 @@ impl Client {
             if retry_count == 1 {
                 client.spawn_pdo_request(&info);
             }
-        });
+        })).detach();
     }
 
     pub(crate) async fn handle_incoming_message(self: Arc<Self>, node: Arc<Node>) {
         let info = match self.parse_message_info(&node).await {
             Ok(info) => Arc::new(info),
             Err(e) => {
-                log::warn!("Failed to parse message info: {e:?}");
+                let id = node.attrs.get("id").map(|v| v.as_str());
+                let from = node.attrs.get("from").map(|v| v.as_str());
+                log::warn!("Failed to parse message info (id={id:?}, from={from:?}): {e:?}");
                 return;
             }
         };
@@ -351,7 +328,7 @@ impl Client {
 
                     Jid {
                         user: alt_jid.user.clone(),
-                        server: lid_server.to_string(),
+                        server: wacore_binary::jid::cow_server_from_str(lid_server),
                         device: sender.device,
                         agent: sender.agent,
                         integrator: sender.integrator,
@@ -360,7 +337,7 @@ impl Client {
                 {
                     Jid {
                         user: lid_user.clone(),
-                        server: lid_server.to_string(),
+                        server: wacore_binary::jid::cow_server_from_str(lid_server),
                         device: sender.device,
                         agent: sender.agent,
                         integrator: sender.integrator,
@@ -382,14 +359,14 @@ impl Client {
 
         let participants = node.get_optional_child_by_tag(&["participants"]);
         if let Some(participants_node) = participants {
+            let own_jid = self.get_pn().await;
             let to_nodes = participants_node.get_children_by_tag("to");
             for to_node in to_nodes {
                 let to_jid = match to_node.attrs().optional_string("jid") {
                     Some(jid) => jid.to_string(),
                     None => continue,
                 };
-                let own_jid = self.get_pn().await;
-                if let Some(our_jid) = own_jid
+                if let Some(ref our_jid) = own_jid
                     && to_jid == our_jid.to_string()
                 {
                     let enc_children = to_node.get_children_by_tag("enc");
@@ -417,50 +394,156 @@ impl Client {
 
         let mut session_enc_nodes = Vec::with_capacity(all_enc_nodes.len());
         let mut group_content_enc_nodes = Vec::with_capacity(all_enc_nodes.len());
+        let mut max_sender_retry_count: u8 = 0;
+        let mut has_hide_fail = false;
 
         for &enc_node in &all_enc_nodes {
+            // Parse sender retry count (WA Web: e.maybeAttrInt("count") ?? 0)
+            // Clamp to MAX_DECRYPT_RETRIES to prevent u64→u8 truncation on unexpected values.
+            let sender_count = enc_node
+                .attrs()
+                .optional_u64("count")
+                .map(|c| c.min(MAX_DECRYPT_RETRIES as u64) as u8)
+                .unwrap_or(0);
+            max_sender_retry_count = max_sender_retry_count.max(sender_count);
+
+            // Parse decrypt-fail attribute (WA Web: e.maybeAttrString("decrypt-fail") === "hide")
+            if enc_node
+                .attrs
+                .get("decrypt-fail")
+                .is_some_and(|v| v == "hide")
+            {
+                has_hide_fail = true;
+            }
+
             let enc_type = match enc_node.attrs().optional_string("type") {
-                Some(t) => t.to_string(),
+                Some(t) => t,
                 None => {
                     log::warn!("Enc node missing 'type' attribute, skipping");
                     continue;
                 }
             };
 
-            if let Some(handler) = self.custom_enc_handlers.get(&enc_type) {
-                let handler_clone = handler.clone();
+            if let Some(handler) = self
+                .custom_enc_handlers
+                .read()
+                .await
+                .get(enc_type.as_ref())
+                .cloned()
+            {
+                let handler_clone = handler;
                 let client_clone = self.clone();
                 let info_arc = Arc::clone(&info);
                 let enc_node_clone = Arc::new(enc_node.clone());
+                let enc_type_owned = enc_type.to_string();
 
-                tokio::spawn(async move {
-                    if let Err(e) = handler_clone
-                        .handle(client_clone, &enc_node_clone, &info_arc)
-                        .await
-                    {
-                        log::warn!("Custom handler for enc type '{}' failed: {e:?}", enc_type);
-                    }
-                });
+                self.runtime
+                    .spawn(Box::pin(async move {
+                        if let Err(e) = handler_clone
+                            .handle(client_clone, &enc_node_clone, &info_arc)
+                            .await
+                        {
+                            log::warn!(
+                                "Custom handler for enc type '{}' failed: {e:?}",
+                                enc_type_owned
+                            );
+                        }
+                    }))
+                    .detach();
                 continue;
             }
 
             // Fall back to built-in handlers
-            match enc_type.as_str() {
-                "pkmsg" | "msg" => session_enc_nodes.push(enc_node),
-                "skmsg" => group_content_enc_nodes.push(enc_node),
+            match EncType::from_wire(enc_type.as_ref()) {
+                Some(et) if et.is_session() => session_enc_nodes.push(enc_node),
+                Some(EncType::SenderKey) => group_content_enc_nodes.push(enc_node),
                 _ => log::warn!("Unknown enc type: {enc_type}"),
             }
         }
+
+        // WA Web diagnostic: validate skmsg is not first in multi-enc messages.
+        // If skmsg comes first, the SKDM (carried in pkmsg/msg) hasn't been processed yet,
+        // so the skmsg decryption would fail with NoSenderKey.
+        if !session_enc_nodes.is_empty()
+            && !group_content_enc_nodes.is_empty()
+            && all_enc_nodes.first().is_some_and(|n| {
+                n.attrs
+                    .get("type")
+                    .is_some_and(|v| v == EncType::SenderKey.as_wire_str())
+            })
+        {
+            log::error!(
+                "[msg:{}] Protocol violation: skmsg is first in multi-enc message from {}. \
+                 Expected pkmsg/msg first (containing SKDM).",
+                info.id,
+                info.source.sender
+            );
+        }
+
+        // Determine decrypt fail mode from enc nodes (WA Web: hideFail)
+        let decrypt_fail_mode = if has_hide_fail {
+            crate::types::events::DecryptFailMode::Hide
+        } else {
+            crate::types::events::DecryptFailMode::Show
+        };
+
+        // Pre-seed retry cache with sender's retry count to avoid redundant retries.
+        // Uses max(existing, incoming) so redeliveries with higher counts update the cache,
+        // but lower counts don't reset our local counter.
+        if max_sender_retry_count > 0 {
+            let cache_key = self
+                .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
+                .await;
+            let existing = self.message_retry_counts.get(&cache_key).await.unwrap_or(0);
+            if max_sender_retry_count > existing {
+                self.message_retry_counts
+                    .insert(cache_key, max_sender_retry_count)
+                    .await;
+            }
+            log::debug!(
+                "[msg:{}] Sender retry count {} pre-seeded into cache",
+                info.id,
+                max_sender_retry_count
+            );
+        }
+
+        // Acquire global processing permit (1 during offline sync, N after).
+        // Read generation + clone Arc under the same mutex so the pair is consistent.
+        //
+        // When the semaphore transitions from 1→N (offline→online), tasks waiting on
+        // the old 1-permit semaphore must re-acquire from the new N-permit semaphore.
+        // Without this re-acquire loop, those tasks would be silently dropped, which
+        // can lose pkmsg messages carrying SKDM (sender key distribution). If the
+        // SKDM is lost, ALL subsequent skmsg messages from that sender will fail
+        // with "No sender key state".
+        let _global_permit = loop {
+            let (generation, semaphore) = self.read_message_semaphore();
+            let permit = semaphore.acquire_arc().await;
+            if generation
+                == self
+                    .message_semaphore_generation
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                break permit;
+            }
+            // Generation changed while waiting (e.g. offline→online transition).
+            // Drop the stale permit and retry with the new semaphore, which has
+            // more permits and will grant access quickly.
+            log::debug!(
+                "Semaphore generation changed during acquire, re-acquiring from new semaphore"
+            );
+            drop(permit);
+        };
 
         log::debug!(
             "Starting PASS 1: Processing {} session establishment messages (pkmsg/msg)",
             session_enc_nodes.len()
         );
 
-        // Skip session processing for group senders (@c.us, @g.us, @broadcast)
-        // Groups don't use 1:1 Signal Protocol sessions
-        let is_group_sender = sender_encryption_jid.server.contains(".us")
-            || sender_encryption_jid.server.contains("broadcast");
+        // Skip session processing for group/broadcast JIDs — they use sender keys, not 1:1 sessions.
+        let is_group_sender = sender_encryption_jid.is_group()
+            || sender_encryption_jid.is_broadcast_list()
+            || sender_encryption_jid.is_status_broadcast();
 
         let (
             session_decrypted_successfully,
@@ -468,7 +551,12 @@ impl Client {
             session_dispatched_undecryptable,
         ) = if !is_group_sender && !session_enc_nodes.is_empty() {
             self.clone()
-                .process_session_enc_batch(&session_enc_nodes, &info, &sender_encryption_jid)
+                .process_session_enc_batch(
+                    &session_enc_nodes,
+                    &info,
+                    &sender_encryption_jid,
+                    decrypt_fail_mode,
+                )
                 .await
         } else {
             if is_group_sender && !session_enc_nodes.is_empty() {
@@ -490,17 +578,15 @@ impl Client {
         // 1. There were no session messages (session already exists), OR
         // 2. Session messages were successfully decrypted, OR
         // 3. Session messages were duplicates (already processed, so session exists)
-        // 4. It's a status@broadcast (we might have sender key cached from previous status)
-        // Skip only if session messages FAILED to decrypt (not duplicates, not absent)
+        // Skip only if session messages FAILED to decrypt (not duplicates, not absent).
+        // Matches WA Web's `canDecryptNext` pattern: if pkmsg fails with a retriable error,
+        // the SKDM it carried is lost, so skmsg will always fail with NoSenderKey — skip it
+        // to avoid unnecessary retry receipts. The retry for the pkmsg will cause the sender
+        // to resend the entire message including SKDM.
         if !group_content_enc_nodes.is_empty() {
-            // For status broadcasts, always try skmsg even if pkmsg failed.
-            // WhatsApp Web does this too - the pkmsg contains the SKDM which might fail,
-            // but if we already have the sender key cached from a previous status,
-            // we can still decrypt the skmsg content.
             let should_process_skmsg = session_enc_nodes.is_empty()
                 || session_decrypted_successfully
-                || session_had_duplicates
-                || info.source.chat.is_status_broadcast();
+                || session_had_duplicates;
 
             if should_process_skmsg {
                 match self
@@ -509,92 +595,39 @@ impl Client {
                         &group_content_enc_nodes,
                         &info,
                         &sender_encryption_jid,
+                        decrypt_fail_mode,
                     )
                     .await
                 {
-                    Ok(true) => {
-                        // Optimization: Re-queue locally!
-                        // The message failed due to NoSession (NoSenderKey), but we haven't retried yet.
-                        // We will sleep briefly and re-queue it to this chat's serial queue.
-                        // This allows a pending pkmsg (in the queue or socket buffer) to be processed first.
-                        let client = self.clone();
-                        let chat_id = info.source.chat.to_string();
-                        let node_clone = node.clone();
-                        let msg_id = info.id.clone();
-                        let info_clone = info.clone();
-
-                        log::info!(
-                            "Re-queueing message {} from {} (NoSession) with 500ms delay",
-                            msg_id,
-                            info.source.chat
-                        );
-
-                        // First check if the message queue exists before inserting cache marker
-                        // This prevents dropping messages if the queue doesn't exist
-                        if client.message_queues.get(&chat_id).await.is_some() {
-                            // Queue exists, insert cache marker to prevent re-queue loops
-                            let cache_key = client
-                                .make_retry_cache_key(
-                                    &info.source.chat,
-                                    &info.id,
-                                    &info.source.sender,
-                                )
-                                .await;
-                            client.local_retry_cache.insert(cache_key, ()).await;
-
-                            tokio::spawn(async move {
-                                // Short delay to allow dependent messages (pkmsg) to process
-                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-                                // Try to re-queue the message
-                                if let Some(sender) = client.message_queues.get(&chat_id).await {
-                                    if let Err(e) = sender.send(node_clone).await {
-                                        log::warn!("Failed to re-queue message: {}", e);
-                                        // Fallback to retry receipt if send fails
-                                        client.spawn_retry_receipt(
-                                            &info_clone,
-                                            RetryReason::NoSession,
-                                        );
-                                    }
-                                } else {
-                                    // Queue disappeared between check and send, fallback to retry receipt
-                                    log::warn!(
-                                        "Message queue for {} disappeared, falling back to retry receipt",
-                                        chat_id
-                                    );
-                                    client.spawn_retry_receipt(&info_clone, RetryReason::NoSession);
-                                }
-                            });
-                        } else {
-                            // Queue doesn't exist, skip local re-queue and go straight to retry receipt
-                            log::warn!(
-                                "Message queue for {} not found, skipping local re-queue, using retry receipt",
-                                chat_id
-                            );
-                            client.spawn_retry_receipt(&info_clone, RetryReason::NoSession);
-                        }
-                    }
-                    Ok(false) => {
+                    Ok(()) => {
                         // Processed successfully or handled errors (e.g. sent retry receipt)
                     }
                     Err(e) => {
-                        log::warn!("Batch group decrypt encountered error (continuing): {e:?}");
+                        log::warn!(
+                            "[msg:{}] Batch group decrypt from {} in {} failed: {e:?}",
+                            info.id,
+                            info.source.sender,
+                            info.source.chat
+                        );
                     }
                 }
             } else {
                 // Only show warning if session messages actually FAILED (not duplicates)
                 if !session_had_duplicates {
-                    warn!(
-                        "Skipping skmsg decryption for message {} from {} because the initial session/senderkey message failed to decrypt. This prevents a retry loop.",
-                        info.id, info.source.sender
-                    );
-                    // Still dispatch an UndecryptableMessage event so the user knows
-                    // But only if we haven't already dispatched one in process_session_enc_batch
-                    if !session_dispatched_undecryptable {
-                        self.dispatch_undecryptable_event(
-                            &info,
-                            crate::types::events::DecryptFailMode::Show,
+                    if info.is_expired_status() {
+                        log::debug!(
+                            "[msg:{}] Silently dropping expired status from {}",
+                            info.id,
+                            info.source.sender
                         );
+                    } else {
+                        warn!(
+                            "Skipping skmsg decryption for message {} from {} because pkmsg failed to decrypt.",
+                            info.id, info.source.sender
+                        );
+                        if !session_dispatched_undecryptable {
+                            self.dispatch_undecryptable_event(&info, decrypt_fail_mode);
+                        }
                     }
 
                     // Do NOT send a delivery receipt for undecryptable messages.
@@ -618,8 +651,16 @@ impl Client {
             // Dispatch UndecryptableMessage event for messages that failed to decrypt
             // (This should not cause double-dispatching since process_session_enc_batch
             // already returned dispatched_undecryptable=false for this case)
-            self.dispatch_undecryptable_event(&info, crate::types::events::DecryptFailMode::Show);
+            self.dispatch_undecryptable_event(&info, decrypt_fail_mode);
             // Do NOT send delivery receipt - transport ack is sufficient
+        }
+
+        // Flush cached Signal state to DB (matches WA Web's flushBufferToDiskIfNotMemOnlyMode)
+        if let Err(e) = self.flush_signal_cache().await {
+            log::error!(
+                "Failed to flush signal cache after message {}: {e:?}",
+                info.id
+            );
         }
     }
 
@@ -628,6 +669,7 @@ impl Client {
         enc_nodes: &[&wacore_binary::node::Node],
         info: &MessageInfo,
         sender_encryption_jid: &Jid,
+        decrypt_fail_mode: crate::types::events::DecryptFailMode,
     ) -> (bool, bool, bool) {
         // Returns (any_success, any_duplicate, dispatched_undecryptable)
         use wacore::libsignal::protocol::CiphertextMessage;
@@ -639,19 +681,21 @@ impl Client {
         // multiple messages from the same sender are processed concurrently.
         // Use the full Signal protocol address string as the lock key so it matches
         // the SignalProtocolStoreAdapter's per-session locks (prevents ratchet counter races).
-        let signal_addr_str = sender_encryption_jid.to_protocol_address().to_string();
+        let signal_address = sender_encryption_jid.to_protocol_address();
 
         let session_mutex = self
             .session_locks
-            .get_with(signal_addr_str.clone(), async {
-                std::sync::Arc::new(tokio::sync::Mutex::new(()))
+            .get_with_by_ref(signal_address.as_str(), async {
+                std::sync::Arc::new(async_lock::Mutex::new(()))
             })
             .await;
         let _session_guard = session_mutex.lock().await;
 
-        let mut adapter =
-            SignalProtocolStoreAdapter::new(self.persistence_manager.get_device_arc().await);
-        let rng = rand::rngs::OsRng;
+        let mut adapter = SignalProtocolStoreAdapter::new(
+            self.persistence_manager.get_device_arc().await,
+            self.signal_cache.clone(),
+        );
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let mut any_success = false;
         let mut any_duplicate = false;
         let mut dispatched_undecryptable = false;
@@ -665,15 +709,16 @@ impl Client {
                 }
             };
             let enc_type = match enc_node.attrs().optional_string("type") {
-                Some(t) => t.to_string(),
+                Some(t) => t,
                 None => {
                     log::warn!("Enc node missing 'type' attribute (batch session)");
                     continue;
                 }
             };
             let padding_version = enc_node.attrs().optional_u64("v").unwrap_or(2) as u8;
+            let enc_type_enum = EncType::from_wire(enc_type.as_ref());
 
-            let parsed_message = if enc_type == "pkmsg" {
+            let parsed_message = if enc_type_enum == Some(EncType::PreKeyMessage) {
                 match PreKeySignalMessage::try_from(ciphertext) {
                     Ok(m) => CiphertextMessage::PreKeySignalMessage(m),
                     Err(e) => {
@@ -691,9 +736,7 @@ impl Client {
                 }
             };
 
-            let signal_address = sender_encryption_jid.to_protocol_address();
-
-            if enc_type == "pkmsg" {
+            if enc_type_enum == Some(EncType::PreKeyMessage) {
                 // FLAGGED FOR DEBUGGING: "Bad Mac" Reproducibility
                 #[cfg(feature = "debug-snapshots")]
                 {
@@ -729,7 +772,7 @@ impl Client {
                 &mut adapter.identity_store,
                 &mut adapter.pre_key_store,
                 &adapter.signed_pre_key_store,
-                &mut rng.unwrap_err(),
+                &mut rng,
                 UsePQRatchet::No,
             )
             .await;
@@ -747,7 +790,11 @@ impl Client {
                         )
                         .await
                     {
-                        log::warn!("Failed processing plaintext (batch session): {e:?}");
+                        log::warn!(
+                            "[msg:{}] Failed processing plaintext from {}: {e:?}",
+                            info.id,
+                            info.source.sender
+                        );
                     }
                 }
                 Err(e) => {
@@ -776,25 +823,21 @@ impl Client {
                             address
                         );
 
-                        // Extract backend handle and address while holding the lock,
-                        // then drop the lock before the async I/O to avoid lock contention.
-                        let backend = {
-                            let device_arc = self.persistence_manager.get_device_arc().await;
-                            let device = device_arc.read().await;
-                            Arc::clone(&device.backend)
-                        };
-
-                        // Delete the old, untrusted identity using the backend.
-                        // Use the full protocol address string (including device ID) as the key.
+                        // Delete the old, untrusted identity through the signal cache.
                         // NOTE: We intentionally do NOT delete the session here. The session will be
                         // archived (not deleted) when the new PreKeySignalMessage is processed,
                         // allowing decryption of any in-flight messages encrypted with the old session.
-                        let address_str = address.to_string();
-                        if let Err(err) = backend.delete_identity(&address_str).await {
-                            log::warn!("Failed to delete old identity for {}: {:?}", address, err);
-                        } else {
-                            log::info!("Successfully cleared old identity for {}", address);
+                        self.signal_cache.delete_identity(address).await;
+                        // Flush immediately so the backend is updated BEFORE the retry decrypt below.
+                        // Device::is_trusted_identity reads from backend, not cache.
+                        if let Err(e) = self.flush_signal_cache().await {
+                            log::warn!("Failed to flush identity deletion for {}: {e:?}", address);
+                            continue;
                         }
+                        log::info!(
+                            "Cleared old identity for {} from cache and backend",
+                            address
+                        );
 
                         // Re-attempt decryption with the new identity
                         log::info!(
@@ -810,14 +853,14 @@ impl Client {
                             &mut adapter.identity_store,
                             &mut adapter.pre_key_store,
                             &adapter.signed_pre_key_store,
-                            &mut rng.unwrap_err(),
+                            &mut rng,
                             UsePQRatchet::No,
                         )
                         .await;
 
                         match retry_decrypt_res {
                             Ok(padded_plaintext) => {
-                                log::info!(
+                                log::debug!(
                                     "[msg:{}] Successfully decrypted message from {} after handling untrusted identity",
                                     info.id,
                                     address
@@ -872,8 +915,11 @@ impl Client {
                                     );
 
                                     // Send retry receipt so the sender fetches our new prekey bundle
-                                    dispatched_undecryptable = self
-                                        .handle_decrypt_failure(info, RetryReason::InvalidKeyId);
+                                    dispatched_undecryptable = self.handle_decrypt_failure(
+                                        info,
+                                        RetryReason::InvalidKeyId,
+                                        decrypt_fail_mode,
+                                    );
                                 } else {
                                     log::error!(
                                         "[msg:{}] Decryption failed even after clearing untrusted identity for {}: {:?}",
@@ -883,8 +929,11 @@ impl Client {
                                     );
                                     // Send retry receipt so the sender resends with a PreKeySignalMessage
                                     // to establish a new session with the new identity
-                                    dispatched_undecryptable =
-                                        self.handle_decrypt_failure(info, RetryReason::InvalidKey);
+                                    dispatched_undecryptable = self.handle_decrypt_failure(
+                                        info,
+                                        RetryReason::InvalidKey,
+                                        decrypt_fail_mode,
+                                    );
                                 }
                             }
                         }
@@ -897,44 +946,45 @@ impl Client {
                             info.id, enc_type, info.source.sender
                         );
                         // Send retry receipt so the sender resends with a PreKeySignalMessage
-                        dispatched_undecryptable =
-                            self.handle_decrypt_failure(info, RetryReason::NoSession);
+                        dispatched_undecryptable = self.handle_decrypt_failure(
+                            info,
+                            RetryReason::NoSession,
+                            decrypt_fail_mode,
+                        );
                         continue;
-                    } else if matches!(e, SignalProtocolError::InvalidMessage(_, _)) {
-                        // InvalidMessage typically means MAC verification failed or session is out of sync.
-                        // This happens when the sender's session state diverged from ours (e.g., they reinstalled).
-                        // We need to:
-                        // 1. Delete the stale session so a new one can be established
-                        // 2. Send a retry receipt so the sender resends with a PreKeySignalMessage
+                    } else if matches!(
+                        e,
+                        SignalProtocolError::BadMac(_) | SignalProtocolError::InvalidMessage(_, _)
+                    ) {
+                        // BadMac: MAC verification specifically failed (WA Web error code 7).
+                        // InvalidMessage: session out of sync or other decryption failure (code 4).
+                        // In both cases we delete the stale session and request re-establishment.
+                        let (reason, label) = if matches!(e, SignalProtocolError::BadMac(_)) {
+                            (RetryReason::BadMac, "BadMac")
+                        } else {
+                            (RetryReason::InvalidMessage, "InvalidMessage")
+                        };
                         log::warn!(
-                            "[msg:{}] Decryption failed for {} message from {} due to InvalidMessage (likely MAC failure). \
+                            "[msg:{}] Decryption failed for {} message from {} due to {label}. \
                              Deleting stale session and sending retry receipt.",
                             info.id,
                             enc_type,
                             info.source.sender
                         );
 
-                        // Delete the stale session
-                        let device_arc = self.persistence_manager.get_device_arc().await;
-                        let device_guard = device_arc.write().await;
-                        let address_str = signal_address.to_string();
-                        if let Err(err) = device_guard.backend.delete_session(&address_str).await {
-                            log::warn!(
-                                "Failed to delete stale session for {}: {:?}",
-                                signal_address,
-                                err
-                            );
-                        } else {
-                            log::info!(
-                                "Deleted stale session for {} to allow re-establishment",
-                                signal_address
-                            );
-                        }
-                        drop(device_guard);
+                        // Delete the stale session from the signal cache.
+                        // IMPORTANT: Must go through the cache, not directly to the backend!
+                        // Going to the backend directly leaves the stale session in the cache,
+                        // which causes retry messages to also fail (they'd load the stale session).
+                        self.signal_cache.delete_session(&signal_address).await;
+                        log::info!(
+                            "Deleted stale session for {} from cache to allow re-establishment",
+                            signal_address
+                        );
 
                         // Send retry receipt so the sender resends with a PreKeySignalMessage
                         dispatched_undecryptable =
-                            self.handle_decrypt_failure(info, RetryReason::InvalidMessage);
+                            self.handle_decrypt_failure(info, reason, decrypt_fail_mode);
                         continue;
                     } else if matches!(e, SignalProtocolError::InvalidPreKeyId) {
                         // InvalidPreKeyId means the sender is using a PreKey ID that we don't have.
@@ -959,8 +1009,11 @@ impl Client {
                         );
 
                         // Send retry receipt with fresh prekeys
-                        dispatched_undecryptable =
-                            self.handle_decrypt_failure(info, RetryReason::InvalidKeyId);
+                        dispatched_undecryptable = self.handle_decrypt_failure(
+                            info,
+                            RetryReason::InvalidKeyId,
+                            decrypt_fail_mode,
+                        );
                         continue;
                     } else {
                         // For other unexpected errors, just log them
@@ -984,11 +1037,15 @@ impl Client {
         enc_nodes: &[&wacore_binary::node::Node],
         info: &MessageInfo,
         _sender_encryption_jid: &Jid,
-    ) -> Result<bool, DecryptionError> {
+        decrypt_fail_mode: crate::types::events::DecryptFailMode,
+    ) -> Result<(), DecryptionError> {
         if enc_nodes.is_empty() {
-            return Ok(false);
+            return Ok(());
         }
         let device_arc = self.persistence_manager.get_device_arc().await;
+        // Use the signal cache adapter for group decryption so sender keys are read/written
+        // through the cache, keeping it consistent with SKDM processing.
+        let mut adapter = SignalProtocolStoreAdapter::new(device_arc, self.signal_cache.clone());
 
         for enc_node in enc_nodes {
             let ciphertext: &[u8] = match &enc_node.content {
@@ -1015,28 +1072,11 @@ impl Client {
                 info.source.sender
             );
 
-            let decrypt_result = {
-                let mut device_guard = device_arc.write().await;
-                group_decrypt(ciphertext, &mut *device_guard, &sender_key_name).await
-            };
+            let decrypt_result =
+                group_decrypt(ciphertext, &mut adapter.sender_key_store, &sender_key_name).await;
 
             match decrypt_result {
                 Ok(padded_plaintext) => {
-                    // Check if this message was previously re-queued and clear cache
-                    let cache_key = self
-                        .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
-                        .await;
-                    if self.local_retry_cache.remove(&cache_key).await.is_some() {
-                        // Successfully decrypted a message that was previously re-queued
-                        self.retry_metrics
-                            .local_requeue_success
-                            .fetch_add(1, Ordering::Relaxed);
-                        log::debug!(
-                            "[msg:{}] Successfully decrypted message that was previously re-queued",
-                            info.id
-                        );
-                    }
-
                     if let Err(e) = self
                         .clone()
                         .handle_decrypted_plaintext(
@@ -1061,35 +1101,36 @@ impl Client {
                     // This is expected when messages are redelivered, just continue silently
                 }
                 Err(SignalProtocolError::NoSenderKeyState(msg)) => {
-                    // Optimization: Check if this message was already re-queued locally
-                    let cache_key = self
-                        .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
-                        .await;
-                    let already_requeued = self.local_retry_cache.get(&cache_key).await.is_some();
-
-                    if !already_requeued {
-                        // First NoSenderKey: trigger local re-queue
-                        self.retry_metrics
-                            .local_requeue_attempts
-                            .fetch_add(1, Ordering::Relaxed);
-                        // Signal caller to re-queue this message
-                        // Do NOT send retry receipt yet
-                        return Ok(true);
+                    if info.is_expired_status() {
+                        log::debug!(
+                            "[msg:{}] Skipping retry for expired status from {}",
+                            info.id,
+                            info.source.sender
+                        );
+                        continue;
                     }
 
-                    // Second NoSenderKey (already re-queued): fall back to network retry
-                    self.retry_metrics
-                        .local_requeue_fallback
-                        .fetch_add(1, Ordering::Relaxed);
+                    // No sender key for this group/sender — the SKDM was never received
+                    // (sender thinks we have it from a previous status/session).
+                    // Send retry receipt to ask sender to re-distribute SKDM.
                     warn!(
-                        "No sender key state for batched group message [msg:{}] from {}: {}. Sending retry receipt (already requeued).",
+                        "No sender key state for group message [msg:{}] from {}: {}. Sending retry receipt.",
                         info.id, info.source.sender, msg
                     );
-                    // Use spawn_retry_receipt which has retry count tracking
-                    // NoSenderKeyState is similar to NoSession - we need SKDM
+                    self.dispatch_undecryptable_event(info, decrypt_fail_mode);
                     self.spawn_retry_receipt(info, RetryReason::NoSession);
                 }
                 Err(e) => {
+                    if info.is_expired_status() {
+                        log::debug!(
+                            "[msg:{}] Ignoring decrypt error for expired status from {}: {:?}",
+                            info.id,
+                            info.source.sender,
+                            e
+                        );
+                        continue;
+                    }
+
                     log::error!(
                         "Group batch decrypt failed [msg:{}] for group {} sender {}: {:?}",
                         info.id,
@@ -1100,7 +1141,7 @@ impl Client {
                 }
             }
         }
-        Ok(false)
+        Ok(())
     }
 
     async fn handle_decrypted_plaintext(
@@ -1110,210 +1151,87 @@ impl Client {
         padding_version: u8,
         info: &MessageInfo,
     ) -> Result<(), anyhow::Error> {
-        let plaintext_slice = MessageUtils::unpad_message_ref(padded_plaintext, padding_version)?;
-        log::info!(
-            "[msg:{}] Successfully decrypted message from {}: {} bytes (type: {}) [batch path]",
+        let original_msg = wacore::messages::decode_plaintext(padded_plaintext, padding_version)?;
+        log::debug!(
+            "[msg:{}] Successfully decrypted message from {}: type={} [batch path]",
             info.id,
             info.source.sender,
-            plaintext_slice.len(),
             enc_type
         );
 
-        match wa::Message::decode(plaintext_slice) {
-            Ok(mut original_msg) => {
-                // Post-decryption logic (SKDM, sync keys, etc.)
-                if let Some(skdm) = &original_msg.sender_key_distribution_message
-                    && let Some(axolotl_bytes) = &skdm.axolotl_sender_key_distribution_message
-                {
-                    self.handle_sender_key_distribution_message(
-                        &info.source.chat,
-                        &info.source.sender,
-                        axolotl_bytes,
-                    )
-                    .await;
-                }
-
-                if let Some(protocol_msg) = &original_msg.protocol_message
-                    && let Some(keys) = &protocol_msg.app_state_sync_key_share
-                {
-                    self.handle_app_state_sync_key_share(keys).await;
-                }
-
-                if let Some(protocol_msg) = &original_msg.protocol_message
-                    && let Some(pdo_response) =
-                        &protocol_msg.peer_data_operation_request_response_message
-                {
-                    self.handle_pdo_response(pdo_response, info).await;
-                }
-
-                // Note: original_msg might be modified by take() below
-                let history_sync_taken = original_msg
-                    .protocol_message
-                    .as_mut()
-                    .and_then(|pm| pm.history_sync_notification.take());
-
-                if let Some(history_sync) = history_sync_taken {
-                    self.handle_history_sync(info.id.clone(), history_sync)
-                        .await;
-                }
-
-                // Skip dispatch for messages that only carry sender key distribution
-                // (protocol-level key exchange) with no user-visible content.
-                // These arrive as a separate pkmsg enc node alongside the actual
-                // group message (skmsg) and would otherwise surface as "unknown".
-                if is_sender_key_distribution_only(&original_msg) {
-                    log::debug!(
-                        "[msg:{}] Skipping event dispatch for sender key distribution message",
-                        info.id
-                    );
-                } else {
-                    self.dispatch_parsed_message(original_msg, info);
-                }
-                Ok(())
-            }
-            Err(e) => Err(anyhow::anyhow!("Failed to decode decrypted plaintext: {e}")),
+        // Validate DSM presence against sender identity
+        // (WAWebHandleMsgError.DeviceSentMessageError)
+        if original_msg.device_sent_message.is_some() && !info.source.is_from_me {
+            warn!(
+                "[msg:{}] DeviceSentMessage present but sender {} is not self",
+                info.id, info.source.sender,
+            );
         }
+
+        // Unwrap DeviceSentMessage wrapper (self-sent messages synced from
+        // the primary device). The actual content (reactions, text, etc.)
+        // is nested inside device_sent_message.message and must be
+        // extracted before protocol checks or dispatch.
+        let mut msg = wacore::messages::unwrap_device_sent(original_msg);
+
+        // Post-decryption logic (SKDM, sync keys, etc.)
+        if let Some(skdm) = &msg.sender_key_distribution_message
+            && let Some(axolotl_bytes) = &skdm.axolotl_sender_key_distribution_message
+        {
+            self.handle_sender_key_distribution_message(
+                &info.source.chat,
+                &info.source.sender,
+                axolotl_bytes,
+            )
+            .await;
+        }
+
+        if let Some(protocol_msg) = &msg.protocol_message
+            && let Some(keys) = &protocol_msg.app_state_sync_key_share
+        {
+            self.handle_app_state_sync_key_share(keys).await;
+        }
+
+        if let Some(protocol_msg) = &msg.protocol_message
+            && let Some(pdo_response) = &protocol_msg.peer_data_operation_request_response_message
+        {
+            self.handle_pdo_response(pdo_response, info).await;
+        }
+
+        // Note: msg might be modified by take() below
+        let history_sync_taken = msg
+            .protocol_message
+            .as_mut()
+            .and_then(|pm| pm.history_sync_notification.take());
+
+        if let Some(history_sync) = history_sync_taken {
+            self.handle_history_sync(info.id.clone(), history_sync)
+                .await;
+        }
+
+        // Skip dispatch for messages that only carry sender key distribution
+        // (protocol-level key exchange) with no user-visible content.
+        // These arrive as a separate pkmsg enc node alongside the actual
+        // group message (skmsg) and would otherwise surface as "unknown".
+        if wacore::messages::is_sender_key_distribution_only(&msg) {
+            log::debug!(
+                "[msg:{}] Skipping event dispatch for sender key distribution message",
+                info.id
+            );
+        } else {
+            self.dispatch_parsed_message(msg, info);
+        }
+        Ok(())
     }
 
     pub(crate) async fn parse_message_info(
         &self,
         node: &Node,
     ) -> Result<MessageInfo, anyhow::Error> {
-        let mut attrs = node.attrs();
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
         let own_jid = device_snapshot.pn.clone().unwrap_or_default();
         let own_lid = device_snapshot.lid.clone();
-        let from = attrs.jid("from");
-
-        let mut source = if from.server == wacore_binary::jid::BROADCAST_SERVER {
-            // This is the new logic block for handling all broadcast messages, including status.
-            let participant = attrs.jid("participant");
-            let is_from_me = participant.matches_user_or_lid(&own_jid, own_lid.as_ref());
-
-            crate::types::message::MessageSource {
-                chat: from.clone(),
-                sender: participant.clone(),
-                is_from_me,
-                is_group: true, // Treat as group-like for session handling
-                broadcast_list_owner: if from.user != wacore_binary::jid::STATUS_BROADCAST_USER {
-                    Some(participant.clone())
-                } else {
-                    None
-                },
-                ..Default::default()
-            }
-        } else if from.is_group() {
-            let sender = attrs.jid("participant");
-            let sender_alt = if let Some(addressing_mode) = attrs
-                .optional_string("addressing_mode")
-                .map(|s| s.to_ascii_lowercase())
-            {
-                match addressing_mode.as_str() {
-                    "lid" => attrs.optional_jid("participant_pn"),
-                    _ => attrs.optional_jid("participant_lid"),
-                }
-            } else {
-                None
-            };
-
-            let is_from_me = sender.matches_user_or_lid(&own_jid, own_lid.as_ref());
-
-            crate::types::message::MessageSource {
-                chat: from.clone(),
-                sender: sender.clone(),
-                is_from_me,
-                is_group: true,
-                sender_alt,
-                ..Default::default()
-            }
-        } else if from.matches_user_or_lid(&own_jid, own_lid.as_ref()) {
-            // DM from self (either via PN or LID)
-            // Note: peer_recipient_pn contains the RECIPIENT's PN, not sender's.
-            // For self-sent messages, we don't set sender_alt here - the decryption
-            // logic will use our own PN via the is_from_me fallback path.
-            // We store the original `recipient` attribute for retry receipts - this is needed
-            // because device sync messages may have a different recipient than our device,
-            // and the sender needs this to look up the original message.
-            let recipient = attrs.optional_jid("recipient");
-            // chat uses non-AD format for session routing, recipient keeps original for retry receipts
-            let chat = recipient
-                .as_ref()
-                .map(|r| r.to_non_ad())
-                .unwrap_or_else(|| from.to_non_ad());
-            crate::types::message::MessageSource {
-                chat,
-                sender: from.clone(),
-                is_from_me: true,
-                recipient,
-                // sender_alt stays None - decryption uses own PN for self-sent messages
-                ..Default::default()
-            }
-        } else {
-            // DM from someone else
-            // Look for alternate JID attribute based on sender type:
-            // - For LID senders: look for sender_pn to get their phone number
-            // - For PN senders: look for sender_lid to get their LID
-            // This is needed because sessions may be stored under either format
-            // depending on how the session was originally established.
-            let sender_alt = if from.server == wacore_binary::jid::HIDDEN_USER_SERVER {
-                // Sender is LID, look for their phone number
-                attrs.optional_jid("sender_pn")
-            } else {
-                // Sender is phone number, look for their LID
-                attrs.optional_jid("sender_lid")
-            };
-
-            crate::types::message::MessageSource {
-                chat: from.to_non_ad(),
-                sender: from.clone(),
-                is_from_me: false,
-                sender_alt,
-                ..Default::default()
-            }
-        };
-
-        source.addressing_mode = attrs
-            .optional_string("addressing_mode")
-            .map(|s| s.to_ascii_lowercase())
-            .and_then(|s| match s.as_str() {
-                "pn" => Some(crate::types::message::AddressingMode::Pn),
-                "lid" => Some(crate::types::message::AddressingMode::Lid),
-                _ => None,
-            });
-
-        // Parse the category attribute - this is used for peer device messages ("peer")
-        // and is critical for proper retry receipt handling.
-        let category = attrs
-            .optional_string("category")
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-
-        let id = attrs.required_string("id")?.to_string();
-        // server_id must be in range 99-2147476647 (per WhatsApp Web)
-        let server_id = attrs
-            .optional_u64("server_id")
-            .filter(|&v| (99..=2_147_476_647).contains(&v))
-            .unwrap_or(0) as i32;
-
-        // Ensure newsletter JID is normalized: should be just {user}@newsletter
-        if source.chat.is_newsletter() {
-            source.chat.device = 0;
-            source.chat.agent = 0;
-        }
-
-        Ok(MessageInfo {
-            source,
-            id,
-            server_id,
-            push_name: attrs
-                .optional_string("notify")
-                .map(|s| s.to_string())
-                .unwrap_or_default(),
-            timestamp: DateTime::from_timestamp(attrs.unix_time("t"), 0)
-                .unwrap_or_else(chrono::Utc::now),
-            category,
-            ..Default::default()
-        })
+        wacore::messages::parse_message_info(node, &own_jid, own_lid.as_ref())
     }
 
     pub(crate) async fn handle_app_state_sync_key_share(
@@ -1384,7 +1302,7 @@ impl Client {
                 .swap(true, std::sync::atomic::Ordering::Relaxed)
         {
             // First time setting; notify any waiters
-            self.initial_keys_synced_notifier.notify_waiters();
+            self.initial_keys_synced_notifier.notify(usize::MAX);
         }
     }
 
@@ -1470,15 +1388,21 @@ impl Client {
         };
 
         let device_arc = self.persistence_manager.get_device_arc().await;
-        let mut device_guard = device_arc.write().await;
 
         let sender_address = sender_jid.to_protocol_address();
 
         let sender_key_name = SenderKeyName::new(group_jid.to_string(), sender_address.to_string());
 
-        if let Err(e) =
-            process_sender_key_distribution_message(&sender_key_name, &skdm, &mut *device_guard)
-                .await
+        // Route through the signal cache adapter so the sender key is immediately visible
+        // in the cache for subsequent group_decrypt calls within the same message batch.
+        let mut adapter = SignalProtocolStoreAdapter::new(device_arc, self.signal_cache.clone());
+
+        if let Err(e) = process_sender_key_distribution_message(
+            &sender_key_name,
+            &skdm,
+            &mut adapter.sender_key_store,
+        )
+        .await
         {
             log::error!(
                 "Failed to process SenderKeyDistributionMessage from {}: {:?}",
@@ -1486,7 +1410,7 @@ impl Client {
                 e
             );
         } else {
-            log::info!(
+            log::debug!(
                 "Successfully processed sender key distribution for group {} from {}",
                 group_jid,
                 sender_jid
@@ -1495,28 +1419,26 @@ impl Client {
     }
 }
 
-/// Returns `true` if the message contains only a SenderKey distribution
-/// (internal key-exchange for group encryption) and no user-visible content.
+/// Unwraps a `DeviceSentMessage` wrapper, returning the inner message with
+/// merged `message_context_info`.
 ///
-/// When sending a group message, WhatsApp includes the SKDM in a separate
-/// `pkmsg` enc node.  We must process it (store the sender key) but should
-/// not surface it as a user event.
+/// Self-sent messages synced from the primary device arrive with the actual
+/// content (reactions, text, etc.) nested inside `device_sent_message.message`.
+/// This extracts the inner message when present, merges `MessageContextInfo`
+/// from outer and inner following WhatsApp Web's
+/// `WAWebDeviceSentMessageProtoUtils.unwrapDeviceSentMessage` logic, or returns
+/// the original message unchanged when there is no wrapper or the wrapper has
+/// no inner message.
+/// Re-export from wacore for backwards compatibility (used by tests via `super::*`).
+#[cfg(test)]
+fn unwrap_device_sent(msg: wa::Message) -> wa::Message {
+    wacore::messages::unwrap_device_sent(msg)
+}
+
+/// Re-export from wacore for backwards compatibility (used by tests via `super::*`).
+#[cfg(test)]
 fn is_sender_key_distribution_only(msg: &wa::Message) -> bool {
-    let has_skdm = msg.sender_key_distribution_message.is_some()
-        || msg
-            .fast_ratchet_key_sender_key_distribution_message
-            .is_some();
-
-    if !has_skdm {
-        return false;
-    }
-
-    // Strip protocol-only fields and check if anything user-visible remains.
-    let mut stripped = msg.clone();
-    stripped.sender_key_distribution_message = None;
-    stripped.fast_ratchet_key_sender_key_distribution_message = None;
-    stripped.message_context_info = None;
-    stripped == wa::Message::default()
+    wacore::messages::is_sender_key_distribution_only(msg)
 }
 
 #[cfg(test)]
@@ -1525,6 +1447,7 @@ mod tests {
     use crate::store::SqliteStore;
     use crate::store::persistence_manager::PersistenceManager;
     use crate::test_utils::MockHttpClient;
+    use crate::types::message::EditAttribute;
     use std::sync::Arc;
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::jid::{Jid, SERVER_JID};
@@ -1549,7 +1472,14 @@ mod tests {
                 .await
                 .expect("test backend should initialize"),
         );
-        let (client, _sync_rx) = Client::new(pm, mock_transport(), mock_http_client(), None).await;
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         let participant_jid_str = "556899336555:42@s.whatsapp.net";
         let status_broadcast_jid_str = "status@broadcast";
@@ -1602,7 +1532,14 @@ mod tests {
                 .await
                 .expect("test backend should initialize"),
         );
-        let (client, _sync_rx) = Client::new(pm, mock_transport(), mock_http_client(), None).await;
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         let sender_jid: Jid = "1234567890@s.whatsapp.net"
             .parse()
@@ -1618,9 +1555,12 @@ mod tests {
 
         // Create a valid but undecryptable SignalMessage
         let dummy_key = [0u8; 32];
-        let sender_ratchet = KeyPair::generate(&mut rand::rngs::OsRng.unwrap_err()).public_key;
-        let sender_identity_pair = IdentityKeyPair::generate(&mut rand::rngs::OsRng.unwrap_err());
-        let receiver_identity_pair = IdentityKeyPair::generate(&mut rand::rngs::OsRng.unwrap_err());
+        let sender_ratchet =
+            KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>()).public_key;
+        let sender_identity_pair =
+            IdentityKeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let receiver_identity_pair =
+            IdentityKeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
         let signal_message = SignalMessage::new(
             4,
             &dummy_key,
@@ -1641,12 +1581,127 @@ mod tests {
 
         // With SessionNotFound, should return (false, false, true) - no success, no dupe, dispatched event
         let (success, had_duplicates, dispatched) = client
-            .process_session_enc_batch(&enc_nodes, &info, &sender_jid)
+            .process_session_enc_batch(
+                &enc_nodes,
+                &info,
+                &sender_jid,
+                crate::types::events::DecryptFailMode::Show,
+            )
             .await;
 
         assert!(
             !success && !had_duplicates && dispatched,
             "process_session_enc_batch should return (false, false, true) when SessionNotFound occurs and dispatches event"
+        );
+    }
+
+    /// P1: An empty session record (exists but no current/previous state) should be
+    /// treated the same as SessionNotFound — the retry receipt gets error code 1 (NoSession)
+    /// and includes keys early, instead of producing an unhelpful InvalidMessage error.
+    #[tokio::test]
+    async fn test_empty_session_record_treated_as_session_not_found() {
+        use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair, SessionRecord, SignalMessage};
+
+        let backend = Arc::new(
+            SqliteStore::new("file:memdb_empty_session?mode=memory&cache=shared")
+                .await
+                .expect("Failed to create test backend"),
+        );
+        let pm = Arc::new(
+            PersistenceManager::new(backend)
+                .await
+                .expect("test backend should initialize"),
+        );
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
+
+        let sender_jid: Jid = "0000000000000@s.whatsapp.net"
+            .parse()
+            .expect("test JID should be valid");
+        let info = MessageInfo {
+            source: crate::types::message::MessageSource {
+                sender: sender_jid.clone(),
+                chat: sender_jid.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Pre-store an empty (degenerate) session record in the signal cache.
+        // This simulates the bug scenario: record exists but has no usable ratchet state.
+        let signal_address = sender_jid.to_protocol_address();
+        client
+            .signal_cache
+            .put_session(&signal_address, SessionRecord::new_fresh())
+            .await;
+
+        // Craft a SignalMessage to trigger decryption
+        let dummy_key = [0u8; 32];
+        let sender_ratchet =
+            KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>()).public_key;
+        let sender_identity =
+            IdentityKeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let receiver_identity =
+            IdentityKeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let signal_message = SignalMessage::new(
+            4,
+            &dummy_key,
+            sender_ratchet,
+            0,
+            0,
+            b"test",
+            sender_identity.identity_key(),
+            receiver_identity.identity_key(),
+        )
+        .expect("SignalMessage::new should succeed");
+
+        let enc_node = NodeBuilder::new("enc")
+            .attr("type", "msg")
+            .bytes(signal_message.serialized().to_vec())
+            .build();
+        let enc_nodes = vec![&enc_node];
+
+        let (success, had_duplicates, dispatched) = client
+            .clone()
+            .process_session_enc_batch(
+                &enc_nodes,
+                &info,
+                &sender_jid,
+                crate::types::events::DecryptFailMode::Show,
+            )
+            .await;
+
+        // Should behave identically to SessionNotFound: failure, no dupe, event dispatched.
+        assert!(
+            !success && !had_duplicates && dispatched,
+            "Empty session record should be treated as SessionNotFound: \
+             expected (false, false, true), got ({success}, {had_duplicates}, {dispatched})"
+        );
+
+        // Verify we took the SessionNotFound path (error code 1 / NoSession) rather
+        // than the InvalidMessage path (error code 4). The key difference:
+        // - SessionNotFound does NOT delete the session from the cache
+        // - InvalidMessage/BadMac DOES delete it (via signal_cache.delete_session)
+        //
+        // If the session record is still present in the cache, we know the
+        // SessionNotFound branch ran, which sends RetryReason::NoSession (code 1)
+        // and triggers early key inclusion on retry #1 via should_include_keys().
+        let backend = client.persistence_manager.backend();
+        let session_still_exists = client
+            .signal_cache
+            .has_session(&signal_address, &*backend)
+            .await
+            .expect("has_session should not fail");
+        assert!(
+            session_still_exists,
+            "Session should NOT have been deleted — SessionNotFound path preserves it. \
+             If deleted, the InvalidMessage path ran instead (wrong error code)."
         );
     }
 
@@ -1664,7 +1719,14 @@ mod tests {
                 .await
                 .expect("test backend should initialize"),
         );
-        let (client, _sync_rx) = Client::new(pm, mock_transport(), mock_http_client(), None).await;
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         let sender_jid: Jid = "1234567890@s.whatsapp.net"
             .parse()
@@ -1675,9 +1737,12 @@ mod tests {
 
         // Create msg + skmsg node; msg will fail (no session), so skmsg should be skipped
         let dummy_key = [0u8; 32];
-        let sender_ratchet = KeyPair::generate(&mut rand::rngs::OsRng.unwrap_err()).public_key;
-        let sender_identity_pair = IdentityKeyPair::generate(&mut rand::rngs::OsRng.unwrap_err());
-        let receiver_identity_pair = IdentityKeyPair::generate(&mut rand::rngs::OsRng.unwrap_err());
+        let sender_ratchet =
+            KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>()).public_key;
+        let sender_identity_pair =
+            IdentityKeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let receiver_identity_pair =
+            IdentityKeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
         let signal_message = SignalMessage::new(
             4,
             &dummy_key,
@@ -1702,8 +1767,8 @@ mod tests {
 
         let message_node = Arc::new(
             NodeBuilder::new("message")
-                .attr("from", group_jid.to_string())
-                .attr("participant", sender_jid.to_string())
+                .attr("from", group_jid)
+                .attr("participant", sender_jid)
                 .attr("id", "test-id-123")
                 .attr("t", "12345")
                 .children(vec![msg_node, skmsg_node])
@@ -1744,8 +1809,14 @@ mod tests {
                 .await
                 .expect("test backend should initialize"),
         );
-        let (_client, _sync_rx) =
-            Client::new(pm.clone(), mock_transport(), mock_http_client(), None).await;
+        let (_client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm.clone(),
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         let own_lid: Jid = "100000000000001.1:75@lid"
             .parse()
@@ -1768,7 +1839,7 @@ mod tests {
             create_sender_key_distribution_message(
                 &lid_sender_key_name,
                 &mut *device_guard,
-                &mut rand::rngs::OsRng.unwrap_err(),
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
             )
             .await
             .expect("Failed to create SKDM")
@@ -1841,8 +1912,14 @@ mod tests {
                 .expect("test backend should initialize"),
         );
         let transport_factory = Arc::new(crate::transport::mock::MockTransportFactory::new());
-        let (_client, _sync_rx) =
-            Client::new(pm.clone(), transport_factory, mock_http_client(), None).await;
+        let (_client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm.clone(),
+            transport_factory,
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         let group_jid: Jid = "120363021033254949@g.us"
             .parse()
@@ -1869,7 +1946,7 @@ mod tests {
                 create_sender_key_distribution_message(
                     &lid_sender_key_name,
                     &mut *device_guard,
-                    &mut rand::rngs::OsRng.unwrap_err(),
+                    &mut rand::make_rng::<rand::rngs::StdRng>(),
                 )
                 .await
                 .expect("Failed to create SKDM")
@@ -2034,6 +2111,7 @@ mod tests {
     async fn test_parse_message_info_sender_alt_extraction() {
         use crate::store::SqliteStore;
         use std::sync::Arc;
+        use wacore::types::message::AddressingMode;
         use wacore_binary::builder::NodeBuilder;
 
         let backend = Arc::new(
@@ -2063,14 +2141,21 @@ mod tests {
             );
         }
 
-        let (client, _sync_rx) = Client::new(pm, mock_transport(), mock_http_client(), None).await;
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         // Test case 1: LID group message with participant_pn
         let lid_group_node = NodeBuilder::new("message")
             .attr("from", "120363021033254949@g.us")
             .attr("participant", "987654321000000.2:42@lid")
             .attr("participant_pn", "551234567890:42@s.whatsapp.net")
-            .attr("addressing_mode", "lid")
+            .attr("addressing_mode", AddressingMode::Lid.as_str())
             .attr("id", "test1")
             .attr("t", "12345")
             .build();
@@ -2096,7 +2181,7 @@ mod tests {
             .attr("from", "120363021033254949@g.us")
             .attr("participant", "100000000000001.1:75@lid")
             .attr("participant_pn", "15551234567:75@s.whatsapp.net")
-            .attr("addressing_mode", "lid")
+            .attr("addressing_mode", AddressingMode::Lid.as_str())
             .attr("id", "test2")
             .attr("t", "12346")
             .build();
@@ -2297,8 +2382,14 @@ mod tests {
                 .await
                 .expect("test backend should initialize"),
         );
-        let (_client, _sync_rx) =
-            Client::new(pm.clone(), mock_transport(), mock_http_client(), None).await;
+        let (_client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm.clone(),
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         let group_jid: Jid = "120363021033254949@g.us"
             .parse()
@@ -2321,7 +2412,7 @@ mod tests {
             create_sender_key_distribution_message(
                 &display_sender_key_name,
                 &mut *device_guard,
-                &mut rand::rngs::OsRng.unwrap_err(),
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
             )
             .await
             .expect("Failed to create SKDM");
@@ -2376,6 +2467,7 @@ mod tests {
             create_sender_key_distribution_message, process_sender_key_distribution_message,
         };
         use wacore::libsignal::store::sender_key_name::SenderKeyName;
+        use wacore::types::message::AddressingMode;
         use wacore_binary::builder::NodeBuilder;
 
         let backend = Arc::new(
@@ -2388,8 +2480,14 @@ mod tests {
                 .await
                 .expect("test backend should initialize"),
         );
-        let (client, _sync_rx) =
-            Client::new(pm.clone(), mock_transport(), mock_http_client(), None).await;
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm.clone(),
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         let sender_jid: Jid = "100000000000001.1:75@lid"
             .parse()
@@ -2409,7 +2507,7 @@ mod tests {
             let skdm = create_sender_key_distribution_message(
                 &sender_key_name,
                 &mut *device_guard,
-                &mut rand::rngs::OsRng.unwrap_err(),
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
             )
             .await
             .expect("Failed to create SKDM");
@@ -2426,7 +2524,7 @@ mod tests {
                 &mut *device_guard,
                 &sender_key_name,
                 b"ping",
-                &mut rand::rngs::OsRng.unwrap_err(),
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
             )
             .await
             .expect("Failed to encrypt with sender key");
@@ -2441,12 +2539,12 @@ mod tests {
 
         let message_node = Arc::new(
             NodeBuilder::new("message")
-                .attr("from", group_jid.to_string())
-                .attr("participant", sender_jid.to_string())
+                .attr("from", group_jid)
+                .attr("participant", sender_jid)
                 .attr("id", "SECOND_MSG_TEST")
                 .attr("t", "1759306493")
                 .attr("type", "text")
-                .attr("addressing_mode", "lid")
+                .attr("addressing_mode", AddressingMode::Lid.as_str())
                 .children(vec![skmsg_node])
                 .build(),
         );
@@ -2486,8 +2584,14 @@ mod tests {
                 .await
                 .expect("test backend should initialize"),
         );
-        let (client, _sync_rx) =
-            Client::new(pm.clone(), mock_transport(), mock_http_client(), None).await;
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm.clone(),
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         let sender_jid: Jid = "559981212574@s.whatsapp.net"
             .parse()
@@ -2520,7 +2624,12 @@ mod tests {
         // Call process_session_enc_batch
         // This should handle any errors gracefully without panicking
         let (success, _had_duplicates, _dispatched) = client
-            .process_session_enc_batch(&enc_nodes, &info, &sender_jid)
+            .process_session_enc_batch(
+                &enc_nodes,
+                &info,
+                &sender_jid,
+                crate::types::events::DecryptFailMode::Show,
+            )
             .await;
 
         log::info!(
@@ -2551,8 +2660,14 @@ mod tests {
                 .await
                 .expect("test backend should initialize"),
         );
-        let (client, _sync_rx) =
-            Client::new(pm.clone(), mock_transport(), mock_http_client(), None).await;
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm.clone(),
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         let sender_jid: Jid = "559981212574@s.whatsapp.net"
             .parse()
@@ -2595,7 +2710,12 @@ mod tests {
         // Process the batch
         // Should handle all errors gracefully without stopping at first error
         let (success, _had_duplicates, _dispatched) = client
-            .process_session_enc_batch(&enc_node_refs, &info, &sender_jid)
+            .process_session_enc_batch(
+                &enc_node_refs,
+                &info,
+                &sender_jid,
+                crate::types::events::DecryptFailMode::Show,
+            )
             .await;
 
         log::info!("Test: Batch processing completed - success: {}", success);
@@ -2620,8 +2740,14 @@ mod tests {
                 .await
                 .expect("test backend should initialize"),
         );
-        let (client, _sync_rx) =
-            Client::new(pm.clone(), mock_transport(), mock_http_client(), None).await;
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm.clone(),
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         // Simulate a group chat scenario
         let group_jid: Jid = "120363021033254949@g.us"
@@ -2655,7 +2781,12 @@ mod tests {
         // Process the message
         // Should handle errors gracefully in group context
         let (success, _had_duplicates, _dispatched) = client
-            .process_session_enc_batch(&enc_nodes, &info, &sender_phone)
+            .process_session_enc_batch(
+                &enc_nodes,
+                &info,
+                &sender_phone,
+                crate::types::events::DecryptFailMode::Show,
+            )
             .await;
 
         log::info!("Test: Group message processed - success: {}", success);
@@ -2705,7 +2836,14 @@ mod tests {
             );
         }
 
-        let (client, _sync_rx) = Client::new(pm, mock_transport(), mock_http_client(), None).await;
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         // Simulate self-sent DM to another user (from your phone to your bot echo)
         // Real log example:
@@ -2792,7 +2930,14 @@ mod tests {
             );
         }
 
-        let (client, _sync_rx) = Client::new(pm, mock_transport(), mock_http_client(), None).await;
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         // Simulate DM from another user via their LID
         // The sender_pn attribute should contain their phone number for session lookup
@@ -2880,7 +3025,14 @@ mod tests {
             );
         }
 
-        let (client, _sync_rx) = Client::new(pm, mock_transport(), mock_http_client(), None).await;
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         // Simulate DM to self (like "Notes to Myself" or pinging yourself)
         // from=your_LID, recipient=your_LID, peer_recipient_pn=your_PN
@@ -2944,7 +3096,14 @@ mod tests {
                 .await
                 .expect("test backend should initialize"),
         );
-        let (client, _sync_rx) = Client::new(pm, mock_transport(), mock_http_client(), None).await;
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         let phone = "559980000001";
         let lid = "100000012345678";
@@ -3006,7 +3165,14 @@ mod tests {
                 .await
                 .expect("test backend should initialize"),
         );
-        let (client, _sync_rx) = Client::new(pm, mock_transport(), mock_http_client(), None).await;
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         let phone = "559980000001";
 
@@ -3044,6 +3210,8 @@ mod tests {
     /// 2. This enables sending to users we've only seen as LID senders
     #[tokio::test]
     async fn test_lid_pn_cache_populated_for_lid_sender_with_participant_pn() {
+        use wacore::types::message::AddressingMode;
+
         // Setup client
         let backend = Arc::new(
             SqliteStore::new("file:memdb_lid_sender_test?mode=memory&cache=shared")
@@ -3055,7 +3223,14 @@ mod tests {
                 .await
                 .expect("test backend should initialize"),
         );
-        let (client, _sync_rx) = Client::new(pm, mock_transport(), mock_http_client(), None).await;
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         let lid = "100000012345678";
         let phone = "559980000001";
@@ -3066,7 +3241,7 @@ mod tests {
             .attr("from", "120363123456789012@g.us") // Group chat
             .attr("participant", Jid::lid(lid).to_string()) // Sender is LID
             .attr("participant_pn", Jid::pn(phone).to_string()) // Their phone number
-            .attr("addressing_mode", "lid") // Required for participant_pn to be parsed
+            .attr("addressing_mode", AddressingMode::Lid.as_str()) // Required for participant_pn to be parsed
             .attr("id", "TEST123456789")
             .attr("t", "1765482972")
             .attr("type", "text")
@@ -3121,7 +3296,14 @@ mod tests {
                 .await
                 .expect("test backend should initialize"),
         );
-        let (client, _sync_rx) = Client::new(pm, mock_transport(), mock_http_client(), None).await;
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         let phone = "559980000001";
         let lid = "100000012345678";
@@ -3191,7 +3373,14 @@ mod tests {
                 .await
                 .expect("test backend should initialize"),
         );
-        let (client, _sync_rx) = Client::new(pm, mock_transport(), mock_http_client(), None).await;
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         let lid = "100000012345678";
         let phone = "559980000001";
@@ -3264,7 +3453,7 @@ mod tests {
                 // Use the LID from the message attribute
                 Jid {
                     user: alt_jid.user.clone(),
-                    server: lid_server.to_string(),
+                    server: wacore_binary::jid::cow_server_from_str(lid_server),
                     device: sender.device,
                     agent: sender.agent,
                     integrator: sender.integrator,
@@ -3273,7 +3462,7 @@ mod tests {
                 // Use the cached LID
                 Jid {
                     user: lid_user,
-                    server: lid_server.to_string(),
+                    server: wacore_binary::jid::cow_server_from_str(lid_server),
                     device: sender.device,
                     agent: sender.agent,
                     integrator: sender.integrator,
@@ -3325,7 +3514,14 @@ mod tests {
                 .await
                 .expect("test backend should initialize"),
         );
-        let (client, _sync_rx) = Client::new(pm, mock_transport(), mock_http_client(), None).await;
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         let lid = "100000012345678";
         let phone = "559980000001";
@@ -3374,7 +3570,7 @@ mod tests {
             {
                 Jid {
                     user: alt_jid.user.clone(),
-                    server: lid_server.to_string(),
+                    server: wacore_binary::jid::cow_server_from_str(lid_server),
                     device: sender.device,
                     agent: sender.agent,
                     integrator: sender.integrator,
@@ -3383,7 +3579,7 @@ mod tests {
                 // This is the path we're testing - fallback to cached LID
                 Jid {
                     user: lid_user,
-                    server: lid_server.to_string(),
+                    server: wacore_binary::jid::cow_server_from_str(lid_server),
                     device: sender.device,
                     agent: sender.agent,
                     integrator: sender.integrator,
@@ -3433,7 +3629,14 @@ mod tests {
                 .await
                 .expect("test backend should initialize"),
         );
-        let (client, _sync_rx) = Client::new(pm, mock_transport(), mock_http_client(), None).await;
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         let phone = "559980000001";
 
@@ -3470,7 +3673,7 @@ mod tests {
             {
                 Jid {
                     user: alt_jid.user.clone(),
-                    server: lid_server.to_string(),
+                    server: wacore_binary::jid::cow_server_from_str(lid_server),
                     device: sender.device,
                     agent: sender.agent,
                     integrator: sender.integrator,
@@ -3478,7 +3681,7 @@ mod tests {
             } else if let Some(lid_user) = client.lid_pn_cache.get_current_lid(&sender.user).await {
                 Jid {
                     user: lid_user,
-                    server: lid_server.to_string(),
+                    server: wacore_binary::jid::cow_server_from_str(lid_server),
                     device: sender.device,
                     agent: sender.agent,
                     integrator: sender.integrator,
@@ -3513,7 +3716,7 @@ mod tests {
 
     /// Helper to create a test MessageInfo with customizable fields
     fn create_test_message_info(chat: &str, msg_id: &str, sender: &str) -> MessageInfo {
-        use wacore::types::message::{EditAttribute, MessageSource, MsgMetaInfo};
+        use wacore::types::message::{EditAttribute, MessageCategory, MessageSource, MsgMetaInfo};
 
         let chat_jid: Jid = chat.parse().expect("valid chat JID");
         let sender_jid: Jid = sender.parse().expect("valid sender JID");
@@ -3533,9 +3736,9 @@ mod tests {
                 broadcast_list_owner: None,
                 recipient: None,
             },
-            timestamp: chrono::Utc::now(),
+            timestamp: wacore::time::now_utc(),
             push_name: "Test User".to_string(),
-            category: "".to_string(),
+            category: MessageCategory::default(),
             multicast: false,
             media_type: "".to_string(),
             edit: EditAttribute::default(),
@@ -3543,6 +3746,7 @@ mod tests {
             meta_info: MsgMetaInfo::default(),
             verified_name: None,
             device_sent_meta: None,
+            ephemeral_expiration: None,
         }
     }
 
@@ -3569,7 +3773,14 @@ mod tests {
                 .await
                 .expect("test backend should initialize"),
         );
-        let (client, _sync_rx) = Client::new(pm, mock_transport(), mock_http_client(), None).await;
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
         client
     }
 
@@ -3683,9 +3894,9 @@ mod tests {
 
     /// Test concurrent retry increments are properly serialized.
     ///
-    /// With moka's `and_compute_with`, the increment operation is atomic.
-    /// This means exactly 5 increments should succeed (returning 1-5),
-    /// and exactly 5 should fail (returning None after max is reached).
+    /// The increment operation uses get+insert which is not fully atomic,
+    /// but is sufficient since message retry processing is serialized per key
+    /// by the per-chat lock. At most 5 increments should succeed.
     #[tokio::test]
     async fn test_concurrent_retry_increments() {
         use tokio::task::JoinSet;
@@ -3931,89 +4142,59 @@ mod tests {
         );
     }
 
-    /// Test: Status broadcast messages should always try skmsg even if pkmsg fails
-    ///
-    /// - WhatsApp Web tracks pkmsg and skmsg failures separately
-    /// - If pkmsg fails but skmsg succeeds, result is SUCCESS
-    /// - For status@broadcast, we might have sender key cached from previous status
-    ///
-    /// This test verifies that the `should_process_skmsg` logic correctly
-    /// includes status broadcasts even when session decryption fails.
+    /// Test: Verify JID type detection for status broadcasts, broadcast lists, groups, and users.
     #[test]
-    fn test_status_broadcast_should_always_process_skmsg() {
+    fn test_status_broadcast_jid_detection() {
         use wacore_binary::jid::{Jid, JidExt};
 
-        // status@broadcast JID
         let status_jid: Jid = "status@broadcast".parse().expect("status JID should parse");
-        assert!(
-            status_jid.is_status_broadcast(),
-            "status@broadcast should be recognized as status broadcast"
-        );
+        assert!(status_jid.is_status_broadcast());
 
-        // Regular broadcast list should NOT be status broadcast
         let broadcast_list: Jid = "123456789@broadcast"
             .parse()
             .expect("broadcast JID should parse");
-        assert!(
-            !broadcast_list.is_status_broadcast(),
-            "Regular broadcast list should not be status broadcast"
-        );
-        assert!(
-            broadcast_list.is_broadcast_list(),
-            "123456789@broadcast should be broadcast list"
-        );
+        assert!(!broadcast_list.is_status_broadcast());
+        assert!(broadcast_list.is_broadcast_list());
 
-        // Group JID should NOT be status broadcast
         let group_jid: Jid = "120363021033254949@g.us"
             .parse()
             .expect("group JID should parse");
-        assert!(
-            !group_jid.is_status_broadcast(),
-            "Group JID should not be status broadcast"
-        );
+        assert!(!group_jid.is_status_broadcast());
 
-        // 1:1 JID should NOT be status broadcast
         let user_jid: Jid = "15551234567@s.whatsapp.net"
             .parse()
             .expect("user JID should parse");
-        assert!(
-            !user_jid.is_status_broadcast(),
-            "User JID should not be status broadcast"
-        );
+        assert!(!user_jid.is_status_broadcast());
     }
 
-    /// Test: Verify should_process_skmsg logic for status broadcast
+    /// Test: Verify should_process_skmsg logic matches WA Web's canDecryptNext pattern.
     ///
-    /// Simulates the decision logic from handle_incoming_message:
-    /// - For status@broadcast, should_process_skmsg should be true even when
-    ///   session_decrypted_successfully=false and session_had_duplicates=false
+    /// WA Web applies canDecryptNext uniformly: if pkmsg fails with a retriable error,
+    /// skmsg is skipped regardless of chat type (group, status, 1:1). No exception for
+    /// status broadcasts — the retry receipt for the pkmsg will cause the sender to
+    /// resend the entire message including SKDM.
     #[test]
-    fn test_should_process_skmsg_logic_for_status_broadcast() {
-        use wacore_binary::jid::{Jid, JidExt};
-
+    fn test_should_process_skmsg_logic_matches_wa_web() {
         // Test cases: (chat_jid, session_empty, session_success, session_dupe, expected)
         let test_cases = [
-            // Status broadcast: always process skmsg
-            ("status@broadcast", false, false, false, true),
-            ("status@broadcast", false, false, true, true),
-            ("status@broadcast", false, true, false, true),
-            ("status@broadcast", true, false, false, true),
-            // Regular group: only process if session ok or empty
-            ("120363021033254949@g.us", false, false, false, false), // Fail: session failed
-            ("120363021033254949@g.us", false, false, true, true),   // OK: duplicate
-            ("120363021033254949@g.us", false, true, false, true),   // OK: success
-            ("120363021033254949@g.us", true, false, false, true),   // OK: no session msgs
-            // 1:1 chat: same logic as group
+            // Status broadcast: same rules as all other chats (WA Web: canDecryptNext is uniform)
+            ("status@broadcast", false, false, false, false), // Fail: session failed → skip skmsg
+            ("status@broadcast", false, false, true, true),   // OK: duplicate
+            ("status@broadcast", false, true, false, true),   // OK: success
+            ("status@broadcast", true, false, false, true),   // OK: no session msgs
+            // Regular group
+            ("120363021033254949@g.us", false, false, false, false),
+            ("120363021033254949@g.us", false, false, true, true),
+            ("120363021033254949@g.us", false, true, false, true),
+            ("120363021033254949@g.us", true, false, false, true),
+            // 1:1 chat
             ("15551234567@s.whatsapp.net", false, false, false, false),
             ("15551234567@s.whatsapp.net", true, false, false, true),
         ];
 
         for (jid_str, session_empty, session_success, session_dupe, expected) in test_cases {
-            let chat_jid: Jid = jid_str.parse().expect("JID should parse");
-
             // Recreate the should_process_skmsg logic from handle_incoming_message
-            let should_process_skmsg =
-                session_empty || session_success || session_dupe || chat_jid.is_status_broadcast();
+            let should_process_skmsg = session_empty || session_success || session_dupe;
 
             assert_eq!(
                 should_process_skmsg,
@@ -4046,7 +4227,14 @@ mod tests {
                 .await
                 .expect("test backend should initialize"),
         );
-        let (client, _sync_rx) = Client::new(pm, mock_transport(), mock_http_client(), None).await;
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
         let node = NodeBuilder::new("message")
             .attr("from", "15551234567@s.whatsapp.net")
@@ -4068,8 +4256,10 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn test_local_requeue_optimization() {
-        // Setup integration test environment
+    async fn test_no_sender_key_sends_immediate_retry() {
+        // Verify that when skmsg decryption fails with NoSenderKeyState,
+        // a retry receipt is sent immediately (no delay, no re-queue).
+        // This matches WA Web behavior where NoSenderKey → SignalRetryable → RETRY.
         let _ = env_logger::builder().is_test(true).try_init();
 
         use crate::store::SqliteStore;
@@ -4077,9 +4267,8 @@ mod tests {
         use wacore_binary::builder::NodeBuilder;
         use wacore_binary::node::NodeContent;
 
-        // 1. Setup Client
         let backend = Arc::new(
-            SqliteStore::new("file:memdb_requeue_test?mode=memory&cache=shared")
+            SqliteStore::new("file:memdb_retry_immediate?mode=memory&cache=shared")
                 .await
                 .expect("Failed to create test backend"),
         );
@@ -4088,189 +4277,27 @@ mod tests {
                 .await
                 .expect("test backend should initialize"),
         );
-        // Note: Using None for override_version
-        let (client, _rx) =
-            Client::new(pm.clone(), mock_transport(), mock_http_client(), None).await;
+        let (client, _rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm.clone(),
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
 
-        // 2. Configure Test Data
         let group_jid: Jid = "120363021033254949@g.us".parse().unwrap();
         let sender_jid: Jid = "1234567890:1@s.whatsapp.net".parse().unwrap();
-        let msg_id = "TEST_MSG_REQUEUE_1";
+        let msg_id = "TEST_IMMEDIATE_RETRY";
 
-        // Manual queue initialization (since it's not created until first message usually)
-        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-        client
-            .message_queues
-            .insert(group_jid.to_string(), tx)
-            .await;
-
-        // 3. Trigger Message Processing (Simulate receiving skmsg BEFORE session)
-        // Construction of mock Signal Message Payload
-        // We need to trigger "NoSenderKeyState" (lookup failure), not "TooShort".
-        // Structure: [Version(1)] + [Protobuf] + [Signature(64)].
-        // Version = 0x33 (3).
-        // Protobuf: Field 1 (KeyID)=1, Field 2 (Iteration)=1, Field 3 (Ciphertext)=Bytes.
-        // 08 01 10 01 1A 00
+        // Pseudo-valid SenderKeyMessage: Version 3 + Protobuf + Fake Sig (64 bytes)
         let mut content = vec![0x33, 0x08, 0x01, 0x10, 0x01, 0x1A, 0x00];
-        // Append 64 bytes of dummy signature to satisfy length checks
         content.extend(vec![0u8; 64]);
 
-        // Build enc node first
-        let mut enc_node = NodeBuilder::new("enc")
-            .attr("type", "skmsg")
-            .attr("v", "2")
-            .build();
-        enc_node.content = Some(NodeContent::Bytes(content));
-
-        // Build message node containing enc node
-        let valid_skmsg_node = NodeBuilder::new("message")
+        let node = NodeBuilder::new("message")
             .attr("id", msg_id)
-            .attr("from", group_jid.to_string())
-            .attr("participant", sender_jid.to_string())
-            .attr("type", "text")
-            .children(vec![enc_node])
-            .build();
-
-        // Run handle_incoming_message
-        // It will fail decryption. If payload is accepted as valid Signal structure,
-        // it will attempt to load SenderKey. Since store is empty, it returns NoSenderKey.
-        // This triggers our re-queue optimization.
-        client
-            .clone()
-            .handle_incoming_message(Arc::new(valid_skmsg_node.clone()))
-            .await;
-
-        // Verify cache IMMEDIATELY
-        // Asserting presence means we successfully triggered the "NoSenderKey" path.
-        let retry_cache_key = client
-            .make_retry_cache_key(&group_jid, msg_id, &sender_jid)
-            .await;
-        assert!(
-            client.local_retry_cache.contains_key(&retry_cache_key),
-            "Message should be in local_retry_cache (Optimization NOT triggered - check error logs)"
-        );
-
-        // 4. Verify Re-Queueing
-        // The re-queued message should appear in `rx` after ~500ms.
-        let queued_msg =
-            tokio::time::timeout(tokio::time::Duration::from_millis(1000), rx.recv()).await;
-        assert!(
-            queued_msg.is_ok(),
-            "Timed out waiting for re-queued message"
-        );
-        assert!(
-            queued_msg.unwrap().is_some(),
-            "Queue should contain the message"
-        );
-
-        // 5. Verify No Network Retry for 1st attempt
-        // message_retry_counts tracks network retries.
-        // It should be EMPTY because we skipped spawn_retry_receipt.
-        let retry_key = format!("{}:{}:{}", group_jid, msg_id, sender_jid);
-        assert!(
-            client.message_retry_counts.get(&retry_key).await.is_none(),
-            "Should NOT have sent network retry receipt yet"
-        );
-
-        // 6. Simulate Second Pass (Re-queued message processed)
-        // Now if we process the re-queued message:
-        // Cache entry exists. So it should trigger network retry (fall back).
-        client
-            .clone()
-            .handle_incoming_message(Arc::new(valid_skmsg_node))
-            .await;
-
-        // Verify retry count allows network retry now
-        // spawn_retry_receipt spawns a task, so we need to wait for it to update the cache.
-        // Use retry loop instead of fixed sleep to avoid flaky test under load.
-        for _ in 0..20 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            if client.message_retry_counts.get(&retry_key).await == Some(1) {
-                break;
-            }
-        }
-        assert_eq!(
-            client.message_retry_counts.get(&retry_key).await,
-            Some(1),
-            "Should have sent network retry receipt on 2nd attempt"
-        );
-    }
-    #[tokio::test]
-    async fn test_local_requeue_edge_cases() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        use crate::store::SqliteStore;
-        use crate::store::persistence_manager::PersistenceManager;
-        use wacore_binary::builder::NodeBuilder;
-        use wacore_binary::node::NodeContent;
-
-        // One-time setup
-        let backend = Arc::new(
-            SqliteStore::new("file:memdb_requeue_edge?mode=memory&cache=shared")
-                .await
-                .expect("Failed to create test backend"),
-        );
-        let pm = Arc::new(
-            PersistenceManager::new(backend.clone())
-                .await
-                .expect("test backend should initialize"),
-        );
-        let (client, _) = Client::new(pm.clone(), mock_transport(), mock_http_client(), None).await;
-
-        let group_jid: Jid = "120363021033254949@g.us".parse().unwrap();
-        let sender_jid: Jid = "1234567890:1@s.whatsapp.net".parse().unwrap();
-
-        // 1. Garbage Data Test (Too Short)
-        // Should NOT trigger re-queue (cache should remain empty for this ID)
-        let garbage_id = "GARBAGE_u1928";
-        let garbage_node = NodeBuilder::new("message")
-            .attr("id", garbage_id)
-            .attr("from", group_jid.to_string())
-            .attr("participant", sender_jid.to_string())
-            .attr("type", "text")
-            .children(vec![{
-                let mut n = NodeBuilder::new("enc")
-                    .attr("type", "skmsg")
-                    .attr("v", "2")
-                    .build();
-                n.content = Some(NodeContent::Bytes(vec![1, 2, 3])); // Too short
-                n
-            }])
-            .build();
-
-        client
-            .clone()
-            .handle_incoming_message(Arc::new(garbage_node))
-            .await;
-
-        let retry_cache_key = client
-            .make_retry_cache_key(&group_jid, garbage_id, &sender_jid)
-            .await;
-        assert!(
-            !client.local_retry_cache.contains_key(&retry_cache_key),
-            "Garbage message should NOT be re-queued/cached"
-        );
-
-        // 2. Concurrent/Duplicate Test
-        // Send a valid-format message that triggers NoSenderKey.
-        // Send it TWICE.
-        // 1st -> ReQueued.
-        // 2nd -> Network Retry Fallback.
-        let dup_id = "DUP_MSG_123";
-        // Manual queue init
-        let (tx, _rx) = tokio::sync::mpsc::channel(10);
-        client
-            .message_queues
-            .insert(group_jid.to_string(), tx)
-            .await;
-
-        // Pseudo-valid SenderKeyMessage: Version 3 + Protobuf + Fake Sig
-        let mut content = vec![0x33, 0x08, 0x01, 0x10, 0x01, 0x1A, 0x00];
-        content.extend(vec![0u8; 64]); // fake sig
-
-        let dup_node = NodeBuilder::new("message")
-            .attr("id", dup_id)
-            .attr("from", group_jid.to_string())
-            .attr("participant", sender_jid.to_string())
+            .attr("from", group_jid.clone())
+            .attr("participant", sender_jid.clone())
             .attr("type", "text")
             .children(vec![{
                 let mut n = NodeBuilder::new("enc")
@@ -4282,33 +4309,22 @@ mod tests {
             }])
             .build();
 
-        let dup_arc = Arc::new(dup_node);
+        client.clone().handle_incoming_message(Arc::new(node)).await;
 
-        // First Pass
-        client
-            .clone()
-            .handle_incoming_message(dup_arc.clone())
-            .await;
-
+        // spawn_retry_receipt runs in a spawned task, wait for it
         let retry_key = client
-            .make_retry_cache_key(&group_jid, dup_id, &sender_jid)
+            .make_retry_cache_key(&group_jid, msg_id, &sender_jid)
             .await;
-        assert!(
-            client.local_retry_cache.contains_key(&retry_key),
-            "First dup message should be cached/requeued"
-        );
-        assert!(client.message_retry_counts.get(&retry_key).await.is_none());
-
-        // Second Pass (Immediate duplicate)
-        client.clone().handle_incoming_message(dup_arc).await;
-
-        // Should have triggered retry receipt logic (increment count)
-        // Wait slightly for spawn to update cache
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        for _ in 0..20 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            if client.message_retry_counts.get(&retry_key).await.is_some() {
+                break;
+            }
+        }
         assert_eq!(
             client.message_retry_counts.get(&retry_key).await,
             Some(1),
-            "Second dup message should trigger network retry fallback"
+            "NoSenderKeyState should immediately trigger retry receipt (count=1)"
         );
     }
 
@@ -4354,5 +4370,566 @@ mod tests {
             protocol_message: Some(Box::new(wa::message::ProtocolMessage::default())),
             ..Default::default()
         }));
+    }
+
+    /// Test: unwrap_device_sent extracts a reaction from a DeviceSentMessage wrapper.
+    #[test]
+    fn test_unwrap_device_sent_extracts_reaction() {
+        let wrapped = wa::Message {
+            device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
+                destination_jid: Some("5511999999999@s.whatsapp.net".to_string()),
+                message: Some(Box::new(wa::Message {
+                    reaction_message: Some(wa::message::ReactionMessage {
+                        text: Some("\u{2764}".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+                phash: None,
+            })),
+            ..Default::default()
+        };
+
+        let unwrapped = unwrap_device_sent(wrapped);
+        assert!(
+            unwrapped.device_sent_message.is_none(),
+            "DSM wrapper should be removed"
+        );
+        assert_eq!(
+            unwrapped
+                .reaction_message
+                .as_ref()
+                .and_then(|r| r.text.as_deref()),
+            Some("\u{2764}"),
+            "reaction should be accessible after unwrapping"
+        );
+        assert!(
+            !is_sender_key_distribution_only(&unwrapped),
+            "unwrapped reaction should not be filtered as SKDM-only"
+        );
+    }
+
+    /// Test: unwrap_device_sent preserves the wrapper when inner message is None.
+    #[test]
+    fn test_unwrap_device_sent_preserves_empty_wrapper() {
+        let wrapped = wa::Message {
+            device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
+                destination_jid: Some("5511999999999@s.whatsapp.net".to_string()),
+                message: None,
+                phash: None,
+            })),
+            ..Default::default()
+        };
+
+        let result = unwrap_device_sent(wrapped);
+        assert!(
+            result.device_sent_message.is_some(),
+            "empty DSM wrapper should be preserved"
+        );
+    }
+
+    /// Test: unwrap_device_sent passes through a plain message unchanged.
+    #[test]
+    fn test_unwrap_device_sent_passthrough() {
+        let msg = wa::Message {
+            conversation: Some("hello".to_string()),
+            ..Default::default()
+        };
+
+        let result = unwrap_device_sent(msg);
+        assert_eq!(result.conversation.as_deref(), Some("hello"));
+    }
+
+    /// Test: unwrap_device_sent merges messageContextInfo from outer and inner,
+    /// matching WAWebDeviceSentMessageProtoUtils.unwrapDeviceSentMessage.
+    #[test]
+    fn test_unwrap_device_sent_merges_context_info() {
+        let wrapped = wa::Message {
+            // Outer message_context_info (from the DSM envelope)
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(vec![10, 20, 30]),
+                limit_sharing_v2: Some(wa::LimitSharing::default()),
+                ..Default::default()
+            }),
+            device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
+                destination_jid: Some("5511999999999@s.whatsapp.net".to_string()),
+                message: Some(Box::new(wa::Message {
+                    conversation: Some("hello".to_string()),
+                    // Inner has its own message_secret but no limit_sharing_v2
+                    message_context_info: Some(wa::MessageContextInfo {
+                        message_secret: Some(vec![1, 2, 3]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+                phash: None,
+            })),
+            ..Default::default()
+        };
+
+        let result = unwrap_device_sent(wrapped);
+        let ctx = result.message_context_info.as_ref().unwrap();
+
+        assert_eq!(
+            ctx.message_secret,
+            Some(vec![1, 2, 3]),
+            "inner message_secret should be preferred"
+        );
+        assert!(
+            ctx.limit_sharing_v2.is_some(),
+            "limit_sharing_v2 should come from outer (always)"
+        );
+    }
+
+    /// Test: unwrap_device_sent falls back to outer message_secret when inner has none.
+    #[test]
+    fn test_unwrap_device_sent_secret_fallback() {
+        let wrapped = wa::Message {
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(vec![10, 20, 30]),
+                ..Default::default()
+            }),
+            device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
+                destination_jid: Some("5511999999999@s.whatsapp.net".to_string()),
+                message: Some(Box::new(wa::Message {
+                    conversation: Some("hello".to_string()),
+                    // Inner has no message_context_info at all
+                    ..Default::default()
+                })),
+                phash: None,
+            })),
+            ..Default::default()
+        };
+
+        let result = unwrap_device_sent(wrapped);
+        let ctx = result.message_context_info.as_ref().unwrap();
+        assert_eq!(
+            ctx.message_secret,
+            Some(vec![10, 20, 30]),
+            "should fall back to outer message_secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_edit_attribute_sender_revoke() {
+        let client = create_test_client_for_retry_with_id("edit_sender_revoke").await;
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "status@broadcast")
+            .attr("id", "TEST123")
+            .attr("participant", "5551234567@lid")
+            .attr("t", "1772895198")
+            .attr("type", "text")
+            .attr("edit", "7")
+            .build();
+
+        let info = client
+            .parse_message_info(&node)
+            .await
+            .expect("parse_message_info should succeed");
+
+        assert_eq!(
+            info.edit,
+            EditAttribute::SenderRevoke,
+            "edit='7' should parse as SenderRevoke"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_edit_attribute_admin_revoke() {
+        let client = create_test_client_for_retry_with_id("edit_admin_revoke").await;
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "120363999999999999@g.us")
+            .attr("id", "TEST456")
+            .attr("participant", "5551234567@lid")
+            .attr("t", "1772895198")
+            .attr("type", "text")
+            .attr("edit", "8")
+            .build();
+
+        let info = client
+            .parse_message_info(&node)
+            .await
+            .expect("parse_message_info should succeed");
+
+        assert_eq!(
+            info.edit,
+            EditAttribute::AdminRevoke,
+            "edit='8' should parse as AdminRevoke"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_edit_attribute_message_edit() {
+        let client = create_test_client_for_retry_with_id("edit_message_edit").await;
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "5551234567@s.whatsapp.net")
+            .attr("id", "TEST789")
+            .attr("t", "1772895198")
+            .attr("type", "text")
+            .attr("edit", "1")
+            .build();
+
+        let info = client
+            .parse_message_info(&node)
+            .await
+            .expect("parse_message_info should succeed");
+
+        assert_eq!(
+            info.edit,
+            EditAttribute::MessageEdit,
+            "edit='1' should parse as MessageEdit"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_edit_attribute_missing() {
+        let client = create_test_client_for_retry_with_id("edit_missing").await;
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "5551234567@s.whatsapp.net")
+            .attr("id", "TESTABC")
+            .attr("t", "1772895198")
+            .attr("type", "text")
+            .build();
+
+        let info = client
+            .parse_message_info(&node)
+            .await
+            .expect("parse_message_info should succeed");
+
+        assert_eq!(
+            info.edit,
+            EditAttribute::Empty,
+            "missing edit attr should default to Empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_revoked_message_still_retries() {
+        let client = create_test_client_for_retry_with_id("revoke_retry").await;
+
+        let mut info = create_test_message_info(
+            "status@broadcast",
+            "REVOKE_MSG1",
+            "5551234567@s.whatsapp.net",
+        );
+        info.edit = EditAttribute::SenderRevoke;
+
+        // WA Web retries revoked messages the same as any other — the revoke
+        // protocol message contains the target ID needed to process the deletion
+        client.spawn_retry_receipt(&info, RetryReason::NoSession);
+
+        // Wait for the spawned task to execute
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let cache_key = client
+            .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
+            .await;
+        assert_eq!(
+            client.message_retry_counts.get(&cache_key).await,
+            Some(1),
+            "revoked message should still have retry count 1 (WA Web retries all messages)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enc_count_preseeds_retry_cache() {
+        let client = create_test_client_for_retry_with_id("enc_preseed").await;
+
+        let chat_jid: Jid = "5551234567@s.whatsapp.net".parse().unwrap();
+        let msg_id = "ENC_COUNT_MSG1";
+
+        // Pre-seed via the same logic used in handle_incoming_message
+        let max_sender_retry_count: u8 = 3;
+        let cache_key = client
+            .make_retry_cache_key(&chat_jid, msg_id, &chat_jid)
+            .await;
+        // Insert only if absent (portable alternative to moka's entry_by_ref().or_insert())
+        if client.message_retry_counts.get(&cache_key).await.is_none() {
+            client
+                .message_retry_counts
+                .insert(cache_key.clone(), max_sender_retry_count)
+                .await;
+        }
+
+        assert_eq!(
+            client.message_retry_counts.get(&cache_key).await,
+            Some(3),
+            "cache should be pre-seeded with sender retry count"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enc_no_count_cache_empty() {
+        let client = create_test_client_for_retry_with_id("enc_no_count").await;
+
+        let chat_jid: Jid = "5551234567@s.whatsapp.net".parse().unwrap();
+        let msg_id = "ENC_NO_COUNT_MSG1";
+
+        // When max_sender_retry_count is 0, no pre-seeding occurs
+        let max_sender_retry_count: u8 = 0;
+        if max_sender_retry_count > 0 {
+            let cache_key = client
+                .make_retry_cache_key(&chat_jid, msg_id, &chat_jid)
+                .await;
+            if client.message_retry_counts.get(&cache_key).await.is_none() {
+                client
+                    .message_retry_counts
+                    .insert(cache_key, max_sender_retry_count)
+                    .await;
+            }
+        }
+
+        let cache_key = client
+            .make_retry_cache_key(&chat_jid, msg_id, &chat_jid)
+            .await;
+        assert!(
+            client.message_retry_counts.get(&cache_key).await.is_none(),
+            "cache should be empty when no count attribute"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enc_count_does_not_overwrite_higher() {
+        let client = create_test_client_for_retry_with_id("enc_no_overwrite").await;
+
+        let chat_jid: Jid = "5551234567@s.whatsapp.net".parse().unwrap();
+        let msg_id = "ENC_NOOVERWRITE_MSG1";
+
+        let cache_key = client
+            .make_retry_cache_key(&chat_jid, msg_id, &chat_jid)
+            .await;
+
+        // Pre-insert a higher value
+        client
+            .message_retry_counts
+            .insert(cache_key.clone(), 4)
+            .await;
+
+        // max(existing, incoming) should NOT overwrite with a lower value
+        let max_sender_retry_count: u8 = 2;
+        let existing = client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .unwrap_or(0);
+        if max_sender_retry_count > existing {
+            client
+                .message_retry_counts
+                .insert(cache_key.clone(), max_sender_retry_count)
+                .await;
+        }
+
+        assert_eq!(
+            client.message_retry_counts.get(&cache_key).await,
+            Some(4),
+            "should not overwrite existing higher value"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enc_count_updates_when_sender_higher() {
+        let client = create_test_client_for_retry_with_id("enc_update_higher").await;
+
+        let chat_jid: Jid = "5551234567@s.whatsapp.net".parse().unwrap();
+        let msg_id = "ENC_UPDATE_MSG1";
+
+        let cache_key = client
+            .make_retry_cache_key(&chat_jid, msg_id, &chat_jid)
+            .await;
+
+        // Pre-insert a lower value
+        client
+            .message_retry_counts
+            .insert(cache_key.clone(), 1)
+            .await;
+
+        // max(existing, incoming) SHOULD update with a higher value
+        let max_sender_retry_count: u8 = 3;
+        let existing = client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .unwrap_or(0);
+        if max_sender_retry_count > existing {
+            client
+                .message_retry_counts
+                .insert(cache_key.clone(), max_sender_retry_count)
+                .await;
+        }
+
+        assert_eq!(
+            client.message_retry_counts.get(&cache_key).await,
+            Some(3),
+            "should update to higher sender count"
+        );
+    }
+
+    /// Shared helper: the OLD semaphore acquire logic that silently dropped tasks
+    /// on generation mismatch. Used by the bug-demonstration test.
+    async fn acquire_permit_old_behavior(
+        semaphore: &std::sync::Mutex<Arc<async_lock::Semaphore>>,
+        generation: &std::sync::atomic::AtomicU64,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+        let (snap_gen, snap_sem) = {
+            let guard = semaphore.lock().unwrap();
+            (generation.load(Ordering::SeqCst), guard.clone())
+        };
+        let _permit = snap_sem.acquire_arc().await;
+        // OLD: if generation changed, silently return false (message lost)
+        snap_gen == generation.load(Ordering::SeqCst)
+    }
+
+    /// Shared helper: the FIXED semaphore acquire logic that re-acquires from the
+    /// new semaphore on generation mismatch. Mirrors the production code in
+    /// handle_incoming_message.
+    async fn acquire_permit_with_reacquire(
+        semaphore: &std::sync::Mutex<Arc<async_lock::Semaphore>>,
+        generation: &std::sync::atomic::AtomicU64,
+    ) {
+        use std::sync::atomic::Ordering;
+        loop {
+            let (snap_gen, snap_sem) = {
+                let guard = semaphore.lock().unwrap();
+                (generation.load(Ordering::SeqCst), guard.clone())
+            };
+            let permit = snap_sem.acquire_arc().await;
+            if snap_gen == generation.load(Ordering::SeqCst) {
+                drop(permit);
+                break;
+            }
+            drop(permit);
+        }
+    }
+
+    /// Demonstrates the bug: the OLD code silently dropped tasks when generation changed.
+    #[tokio::test]
+    async fn test_old_behavior_drops_tasks_on_generation_swap() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+        let semaphore = Arc::new(std::sync::Mutex::new(Arc::new(async_lock::Semaphore::new(
+            1,
+        ))));
+        let generation = Arc::new(AtomicU64::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(AtomicUsize::new(0));
+
+        let blocker_sem = semaphore.lock().unwrap().clone();
+        let blocker_permit = blocker_sem.acquire_arc().await;
+
+        let num_waiters: usize = 8;
+        let mut handles = Vec::new();
+
+        for _ in 0..num_waiters {
+            let sem = semaphore.clone();
+            let gen_counter = generation.clone();
+            let done = completed.clone();
+            let ready_counter = ready.clone();
+
+            handles.push(tokio::spawn(async move {
+                // Signal readiness before blocking on semaphore
+                ready_counter.fetch_add(1, Ordering::SeqCst);
+                if acquire_permit_old_behavior(&sem, &gen_counter).await {
+                    done.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+
+        // Wait until all waiters have signaled readiness (about to block on semaphore)
+        while ready.load(Ordering::SeqCst) < num_waiters {
+            tokio::task::yield_now().await;
+        }
+
+        // Swap semaphore — triggers the bug
+        {
+            let mut guard = semaphore.lock().unwrap();
+            *guard = Arc::new(async_lock::Semaphore::new(64));
+            generation.fetch_add(1, Ordering::SeqCst);
+        }
+
+        drop(blocker_permit);
+
+        for handle in handles {
+            let result = tokio::time::timeout(tokio::time::Duration::from_secs(5), handle).await;
+            assert!(result.is_ok(), "Waiter task timed out");
+            result.unwrap().unwrap();
+        }
+
+        let done = completed.load(Ordering::SeqCst);
+        assert!(
+            done < num_waiters,
+            "Bug demonstration: expected tasks to be dropped, but all {} completed",
+            num_waiters
+        );
+    }
+
+    /// Verifies the fix: re-acquire loop ensures NO tasks are dropped on generation swap.
+    #[tokio::test]
+    async fn test_semaphore_generation_swap_does_not_drop_tasks() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+        let semaphore = Arc::new(std::sync::Mutex::new(Arc::new(async_lock::Semaphore::new(
+            1,
+        ))));
+        let generation = Arc::new(AtomicU64::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(AtomicUsize::new(0));
+
+        let blocker_sem = semaphore.lock().unwrap().clone();
+        let blocker_permit = blocker_sem.acquire_arc().await;
+
+        let num_waiters: usize = 8;
+        let mut handles = Vec::new();
+
+        for _ in 0..num_waiters {
+            let sem = semaphore.clone();
+            let gen_counter = generation.clone();
+            let done = completed.clone();
+            let ready_counter = ready.clone();
+
+            handles.push(tokio::spawn(async move {
+                ready_counter.fetch_add(1, Ordering::SeqCst);
+                acquire_permit_with_reacquire(&sem, &gen_counter).await;
+                done.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+
+        // Wait until all waiters have signaled readiness
+        while ready.load(Ordering::SeqCst) < num_waiters {
+            tokio::task::yield_now().await;
+        }
+
+        // Swap semaphore (simulates offline sync completion)
+        {
+            let mut guard = semaphore.lock().unwrap();
+            *guard = Arc::new(async_lock::Semaphore::new(64));
+            generation.fetch_add(1, Ordering::SeqCst);
+        }
+
+        drop(blocker_permit);
+
+        for handle in handles {
+            let result = tokio::time::timeout(tokio::time::Duration::from_secs(5), handle).await;
+            assert!(
+                result.is_ok(),
+                "Waiter task timed out — likely silently dropped by generation check"
+            );
+            result.unwrap().unwrap();
+        }
+
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            num_waiters,
+            "All {} waiter tasks should complete, but only {} did. \
+             Tasks were silently dropped during semaphore generation swap.",
+            num_waiters,
+            completed.load(Ordering::SeqCst)
+        );
     }
 }

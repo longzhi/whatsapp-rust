@@ -6,10 +6,24 @@ use hkdf::Hkdf;
 use hmac::Hmac;
 use hmac::Mac;
 use sha2::Sha256;
+use thiserror::Error;
 use waproto::whatsapp as wa;
 use waproto::whatsapp::ExternalBlobReference;
 use waproto::whatsapp::message::HistorySyncNotification;
 
+#[derive(Debug, Error)]
+pub enum MediaDecryptionError {
+    #[error("downloaded file is too short to contain MAC")]
+    PayloadTooShort,
+    #[error("invalid MAC signature")]
+    InvalidMac,
+    #[error("decryption error: {0}")]
+    Decryption(String),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaType {
     Image,
@@ -20,7 +34,11 @@ pub enum MediaType {
     AppState,
     Sticker,
     StickerPack,
+    StickerPackThumbnail,
     LinkThumbnail,
+    /// Product catalog image — unencrypted, uploads to `/product/image`.
+    /// WA Web: CreateMediaKeys.js throws for this type (no encryption).
+    ProductCatalogImage,
 }
 
 impl MediaType {
@@ -34,10 +52,15 @@ impl MediaType {
             MediaType::AppState => "WhatsApp App State Keys",
             MediaType::Sticker => "WhatsApp Image Keys",
             MediaType::StickerPack => "WhatsApp Sticker Pack Keys",
+            MediaType::StickerPackThumbnail => "WhatsApp Sticker Pack Thumbnail Keys",
             MediaType::LinkThumbnail => "WhatsApp Link Thumbnail Keys",
+            // Unencrypted: app_info unused, but keep a value for the type system.
+            MediaType::ProductCatalogImage => "WhatsApp Image Keys",
         }
     }
 
+    /// Media type string for MMS path construction.
+    /// Matches WAWebMmsMediaTypes and ClientFormatHashUrl.js path mapping.
     pub fn mms_type(&self) -> &'static str {
         match self {
             MediaType::Image | MediaType::Sticker => "image",
@@ -47,8 +70,32 @@ impl MediaType {
             MediaType::History => "md-msg-hist",
             MediaType::AppState => "md-app-state",
             MediaType::StickerPack => "sticker-pack",
+            MediaType::StickerPackThumbnail => "thumbnail-sticker-pack",
             MediaType::LinkThumbnail => "thumbnail-link",
+            MediaType::ProductCatalogImage => "product-catalog-image",
         }
+    }
+
+    /// URL path prefix for upload/download.
+    pub fn upload_path(&self) -> &'static str {
+        match self {
+            MediaType::Image | MediaType::Sticker => "/mms/image",
+            MediaType::Video => "/mms/video",
+            MediaType::Audio => "/mms/audio",
+            MediaType::Document => "/mms/document",
+            MediaType::History => "/mms/md-msg-hist",
+            MediaType::AppState => "/mms/md-app-state",
+            MediaType::StickerPack => "/mms/sticker-pack",
+            MediaType::StickerPackThumbnail => "/mms/thumbnail-sticker-pack",
+            MediaType::LinkThumbnail => "/mms/thumbnail-link",
+            MediaType::ProductCatalogImage => "/product/image",
+        }
+    }
+
+    /// Whether this media type is encrypted (E2E).
+    /// Product catalog images are unencrypted per WA Web (CreateMediaKeys.js:75-76).
+    pub fn is_encrypted(&self) -> bool {
+        !matches!(self, MediaType::ProductCatalogImage)
     }
 }
 
@@ -154,6 +201,11 @@ impl_downloadable!(
 );
 impl_downloadable!(wa::message::AudioMessage, MediaType::Audio, file_length);
 impl_downloadable!(wa::message::StickerMessage, MediaType::Sticker, file_length);
+impl_downloadable!(
+    wa::message::StickerPackMessage,
+    MediaType::StickerPack,
+    file_length
+);
 impl_downloadable!(ExternalBlobReference, MediaType::AppState, file_size_bytes);
 impl_downloadable!(HistorySyncNotification, MediaType::History, file_length);
 
@@ -306,13 +358,29 @@ impl DownloadUtils {
         writer: &mut W,
     ) -> Result<u64> {
         use aes::Aes256;
-        #[allow(deprecated)]
-        use aes::cipher::generic_array::GenericArray;
-        use aes::cipher::{BlockDecrypt, KeyInit};
+        use aes::cipher::KeyInit;
 
         const MAC_SIZE: usize = 10;
         const BLOCK: usize = 16;
         const CHUNK: usize = 8 * 1024;
+
+        fn decrypt_cbc_block(
+            cblock: &[u8],
+            cipher: &Aes256,
+            prev_block: &[u8; BLOCK],
+        ) -> Result<([u8; BLOCK], [u8; BLOCK])> {
+            use aes::cipher::{Block, BlockDecrypt};
+            let cblock_arr: [u8; BLOCK] = cblock
+                .try_into()
+                .map_err(|_| anyhow!("Invalid block size"))?;
+            let mut block: Block<Aes256> = cblock_arr.into();
+            cipher.decrypt_block(&mut block);
+            let mut decrypted: [u8; BLOCK] = block.into();
+            for (b, &p) in decrypted.iter_mut().zip(prev_block.iter()) {
+                *b ^= p;
+            }
+            Ok((decrypted, cblock_arr))
+        }
 
         let (iv, cipher_key, mac_key) = Self::get_media_keys(media_key, app_info)?;
 
@@ -324,7 +392,7 @@ impl DownloadUtils {
             Aes256::new_from_slice(&cipher_key).map_err(|_| anyhow!("Bad AES key length"))?;
 
         let mut bytes_written: u64 = 0;
-        let mut tail: Vec<u8> = Vec::with_capacity(BLOCK + MAC_SIZE);
+        let mut tail: Vec<u8> = Vec::with_capacity(CHUNK + BLOCK + MAC_SIZE);
         let mut prev_block = iv;
 
         let mut read_buf = [0u8; CHUNK];
@@ -340,23 +408,16 @@ impl DownloadUtils {
                 let mut processable_len = tail.len() - (MAC_SIZE + BLOCK);
                 processable_len -= processable_len % BLOCK;
                 if processable_len >= BLOCK {
-                    let (to_process, rest) = tail.split_at(processable_len);
-                    hmac.update(to_process);
-                    for cblock in to_process.chunks_exact(BLOCK) {
-                        #[allow(deprecated)]
-                        let mut block = GenericArray::clone_from_slice(cblock);
-                        cipher.decrypt_block(&mut block);
-                        for (b, p) in block.iter_mut().zip(prev_block.iter()) {
-                            *b ^= *p;
-                        }
-                        writer.write_all(&block)?;
+                    hmac.update(&tail[..processable_len]);
+                    for cblock in tail[..processable_len].chunks_exact(BLOCK) {
+                        let (decrypted, cblock_arr) =
+                            decrypt_cbc_block(cblock, &cipher, &prev_block)?;
+                        writer.write_all(&decrypted)?;
                         bytes_written += BLOCK as u64;
-                        prev_block = match <[u8; BLOCK]>::try_from(cblock) {
-                            Ok(arr) => arr,
-                            Err(_) => return Err(anyhow!("Failed to convert block to array")),
-                        };
+                        prev_block = cblock_arr;
                     }
-                    tail = rest.to_vec();
+                    // Drain processed bytes, reusing the Vec's existing allocation
+                    tail.drain(..processable_len);
                 }
             }
         }
@@ -375,16 +436,9 @@ impl DownloadUtils {
 
         let mut final_plain = Vec::with_capacity(final_ciphertext.len());
         for cblock in final_ciphertext.chunks_exact(BLOCK) {
-            #[allow(deprecated)]
-            let mut block = GenericArray::clone_from_slice(cblock);
-            cipher.decrypt_block(&mut block);
-            for (b, p) in block.iter_mut().zip(prev_block.iter()) {
-                *b ^= *p;
-            }
-            final_plain.extend_from_slice(&block);
-        }
-        if final_plain.is_empty() {
-            return Err(anyhow!("Empty plaintext after decrypt"));
+            let (decrypted, cblock_arr) = decrypt_cbc_block(cblock, &cipher, &prev_block)?;
+            final_plain.extend_from_slice(&decrypted);
+            prev_block = cblock_arr;
         }
         let pad_len = match final_plain.last() {
             Some(&v) => v as usize,
@@ -425,7 +479,7 @@ impl DownloadUtils {
         app_info: MediaType,
     ) -> Result<([u8; 16], [u8; 32], [u8; 32])> {
         let hk = Hkdf::<Sha256>::new(None, media_key);
-        let mut expanded = vec![0u8; 112];
+        let mut expanded = [0u8; 112];
         hk.expand(app_info.app_info().as_bytes(), &mut expanded)
             .map_err(|e| anyhow!("HKDF expand failed: {e}"))?;
         let iv: [u8; 16] = expanded[0..16]
@@ -451,10 +505,10 @@ impl DownloadUtils {
         encrypted_payload: &[u8],
         media_key: &[u8],
         media_type: MediaType,
-    ) -> Result<Vec<u8>> {
+    ) -> std::result::Result<Vec<u8>, MediaDecryptionError> {
         const MAC_SIZE: usize = 10;
         if encrypted_payload.len() <= MAC_SIZE {
-            return Err(anyhow!("Downloaded file is too short to contain MAC"));
+            return Err(MediaDecryptionError::PayloadTooShort);
         }
 
         let (ciphertext, received_mac) =
@@ -464,18 +518,18 @@ impl DownloadUtils {
 
         let computed_mac_full = {
             let mut mac = CryptographicMac::new("HmacSha256", &mac_key)
-                .map_err(|e| anyhow!(e.to_string()))?;
+                .map_err(|e| MediaDecryptionError::Decryption(e.to_string()))?;
             mac.update(&iv);
             mac.update(ciphertext);
             mac.finalize()
         };
         if &computed_mac_full[..MAC_SIZE] != received_mac {
-            return Err(anyhow!("Invalid MAC signature"));
+            return Err(MediaDecryptionError::InvalidMac);
         }
 
         let mut output = Vec::new();
         aes_256_cbc_decrypt_into(ciphertext, &cipher_key, &iv, &mut output)
-            .map_err(|e| anyhow!(e.to_string()))?;
+            .map_err(|e| MediaDecryptionError::Decryption(e.to_string()))?;
         Ok(output)
     }
 }

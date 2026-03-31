@@ -1,17 +1,21 @@
 [package]
 name = "wacore-binary"
-version = "0.2.0"
+version = "0.5.0"
 edition = "2024"
 authors = ["João Lucas <jlucaso@hotmail.com>"]
 license = "MIT"
 repository = "https://github.com/jlucaso1/whatsapp-rust"
 description = "Binary data and constants for WhatsApp protocol"
 
+[package.metadata.cargo-shear]
+ignored = ["phf"]
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = []
+default = ["simd"]
+simd = []
 serde = ["dep:serde"]
 
 [dependencies]

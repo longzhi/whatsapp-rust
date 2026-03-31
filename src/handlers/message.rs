@@ -3,7 +3,6 @@ use crate::client::Client;
 use async_trait::async_trait;
 use log::warn;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use wacore_binary::node::Node;
 
 /// Handler for `<message>` stanzas.
@@ -20,7 +19,8 @@ use wacore_binary::node::Node;
 #[derive(Default)]
 pub struct MessageHandler;
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StanzaHandler for MessageHandler {
     fn tag(&self) -> &'static str {
         "message"
@@ -48,7 +48,7 @@ impl StanzaHandler for MessageHandler {
         // ordering since we hold the lock for the entire enqueue operation.
         let enqueue_mutex = client
             .message_enqueue_locks
-            .get_with_by_ref(&chat_id, async { Arc::new(tokio::sync::Mutex::new(())) })
+            .get_with_by_ref(&chat_id, async { Arc::new(async_lock::Mutex::new(())) })
             .await;
 
         // Acquire the lock - this serializes all enqueue operations for this chat
@@ -58,25 +58,26 @@ impl StanzaHandler for MessageHandler {
         let tx = client
             .message_queues
             .get_with_by_ref(&chat_id, async {
-                // Create a channel with backpressure
-                // Increased capacity to handle high message rates without blocking
-                let (tx, mut rx) = mpsc::channel::<Arc<Node>>(10000);
+                // Bounded capacity provides backpressure to prevent unbounded memory growth.
+                // 500 is enough for burst handling while limiting per-chat memory.
+                let (tx, rx) = async_channel::bounded::<Arc<Node>>(500);
 
                 let client_for_worker = client.clone();
 
-                // Clone these for cleanup when the worker exits
-                let chat_id_for_cleanup = chat_id.clone();
-                let queues_for_cleanup = client.message_queues.clone();
-
-                // Spawn a worker task that processes messages sequentially for this chat
-                tokio::spawn(async move {
-                    while let Some(msg_node) = rx.recv().await {
-                        let client = client_for_worker.clone();
-                        Box::pin(client.handle_incoming_message(msg_node)).await;
-                    }
-                    // Clean up when channel closes to prevent memory leaks
-                    queues_for_cleanup.invalidate(&chat_id_for_cleanup).await;
-                });
+                // Spawn a worker task that processes messages sequentially for this chat.
+                // The worker exits when all tx senders are dropped (cache TTI expiry drops
+                // the cached tx, and any cloned tx's are short-lived). No explicit
+                // invalidate() here — that would race with new queue entries under the
+                // same key (see bug audit #27).
+                client
+                    .runtime
+                    .spawn(Box::pin(async move {
+                        while let Ok(msg_node) = rx.recv().await {
+                            let client = client_for_worker.clone();
+                            Box::pin(client.handle_incoming_message(msg_node)).await;
+                        }
+                    }))
+                    .detach();
 
                 tx
             })

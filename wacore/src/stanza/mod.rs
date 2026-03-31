@@ -4,8 +4,12 @@
 
 pub mod business;
 pub mod devices;
+pub mod groups;
 pub mod message;
+pub mod notification;
+pub mod receipt;
 
 pub use business::*;
 pub use devices::*;
+pub use groups::*;
 pub use message::*;

@@ -172,38 +172,172 @@ impl Client {
         Ok(())
     }
 
-    /// Invalidate the device cache for a specific user.
+    /// Invalidate cached device data for a specific user.
     ///
-    /// This invalidates both the device registry cache (keyed by string) and
-    /// the device cache (keyed by JID). For unknown users, we invalidate both
-    /// possible JID types (LID and PN) to ensure cleanup regardless of which
-    /// type was used when the cache was populated.
+    /// Removes all device registry cache entries (all LID/PN aliases) so the
+    /// next lookup falls through to the database or network.
     pub(crate) async fn invalidate_device_cache(&self, user: &str) {
         let lookup = self.resolve_lookup_keys(user).await;
 
-        // Invalidate device registry cache (string keys)
         for key in lookup.all_keys() {
             self.device_registry_cache.invalidate(key).await;
         }
 
-        // Invalidate device cache (JID keys) with proper types
-        let device_cache = self.get_device_cache().await;
-        match &lookup {
-            UserLookupKeys::LidWithPn { lid, pn } | UserLookupKeys::PnWithLid { lid, pn } => {
-                // We know the exact types - invalidate each with correct JID type
-                device_cache.invalidate(&Jid::lid(lid)).await;
-                device_cache.invalidate(&Jid::pn(pn)).await;
+        debug!("Invalidated device cache for user: {} ({:?})", user, lookup);
+    }
+
+    /// Granularly patch device registry after a device notification.
+    ///
+    /// Matches WA Web's approach: read current → apply diff → write back.
+    /// Looks up the record from cache first, then falls back to the backend
+    /// DB so notifications are never silently dropped.
+    pub(crate) async fn patch_device_add(
+        &self,
+        user: &str,
+        device: &wacore::stanza::devices::DeviceElement,
+    ) {
+        let device_id = device.device_id();
+
+        if let Some(mut record) = self.load_device_record(user).await
+            && !record.devices.iter().any(|d| d.device_id == device_id)
+        {
+            record.devices.push(wacore::store::traits::DeviceInfo {
+                device_id,
+                key_index: device.key_index,
+            });
+            if let Err(e) = self.update_device_list(record).await {
+                warn!("patch_device_add: failed to persist: {e}");
             }
-            UserLookupKeys::Unknown { user } => {
-                // Unknown user - invalidate BOTH types to ensure cleanup.
-                // This handles the edge case where devices were cached under
-                // a JID type we can no longer determine.
-                device_cache.invalidate(&Jid::lid(user)).await;
-                device_cache.invalidate(&Jid::pn(user)).await;
+        }
+    }
+
+    /// Remove a device from the registry after a device remove notification.
+    pub(crate) async fn patch_device_remove(&self, user: &str, device_id: u32) {
+        if let Some(mut record) = self.load_device_record(user).await {
+            let before = record.devices.len();
+            record.devices.retain(|d| d.device_id != device_id);
+            if record.devices.len() != before
+                && let Err(e) = self.update_device_list(record).await
+            {
+                warn!("patch_device_remove: failed to persist: {e}");
+            }
+        }
+    }
+
+    /// Update key_index for a device in the registry.
+    pub(crate) async fn patch_device_update(
+        &self,
+        user: &str,
+        device: &wacore::stanza::devices::DeviceElement,
+    ) {
+        let device_id = device.device_id();
+
+        if let Some(mut record) = self.load_device_record(user).await
+            && let Some(d) = record.devices.iter_mut().find(|d| d.device_id == device_id)
+        {
+            d.key_index = device.key_index;
+            if let Err(e) = self.update_device_list(record).await {
+                warn!("patch_device_update: failed to persist: {e}");
+            }
+        }
+    }
+
+    /// Load a `DeviceListRecord` from cache or DB for patching.
+    async fn load_device_record(
+        &self,
+        user: &str,
+    ) -> Option<wacore::store::traits::DeviceListRecord> {
+        let lookup = self.resolve_lookup_keys(user).await;
+
+        for key in lookup.all_keys() {
+            if let Some(record) = self.device_registry_cache.get(key).await {
+                return Some(record);
             }
         }
 
-        debug!("Invalidated device cache for user: {} ({:?})", user, lookup);
+        let backend = self.persistence_manager.backend();
+        for key in lookup.all_keys() {
+            match backend.get_devices(key).await {
+                Ok(Some(record)) => {
+                    self.device_registry_cache
+                        .insert(record.user.clone(), record.clone())
+                        .await;
+                    return Some(record);
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!("load_device_record: DB lookup failed for {key}: {e}");
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Look up device JIDs from the device registry (cache + DB) for a single user.
+    ///
+    /// Returns `None` if no record exists. On DB hit, re-populates the
+    /// `device_registry_cache` for subsequent `has_device()` calls.
+    ///
+    /// This follows the same 2-tier pattern as [`has_device`]: registry cache first,
+    /// then the backend database.
+    pub(crate) async fn get_devices_from_registry(&self, jid: &Jid) -> Option<Vec<Jid>> {
+        let lookup_keys = self.get_lookup_keys(&jid.user).await;
+
+        // L1: device_registry_cache (moka, fast)
+        for key in &lookup_keys {
+            if let Some(record) = self.device_registry_cache.get(key).await {
+                return Some(Self::reconstruct_device_jids(jid, &record));
+            }
+        }
+
+        // L2: backend DB
+        let backend = self.persistence_manager.backend();
+        for key in &lookup_keys {
+            match backend.get_devices(key).await {
+                Ok(Some(record)) => {
+                    let devices = Self::reconstruct_device_jids(jid, &record);
+                    self.device_registry_cache
+                        .insert(record.user.clone(), record)
+                        .await;
+                    return Some(devices);
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!("get_devices_from_registry: DB lookup failed for {key}: {e}");
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Reconstruct `Vec<Jid>` from a `DeviceListRecord`, using the query JID's
+    /// user part and server type. This ensures that a PN-typed query always
+    /// returns PN-typed device JIDs even if the record is stored under a LID key
+    /// (and vice versa), which matters after PN-to-LID migration.
+    fn reconstruct_device_jids(
+        query_jid: &Jid,
+        record: &wacore::store::traits::DeviceListRecord,
+    ) -> Vec<Jid> {
+        let user = &query_jid.user;
+        record
+            .devices
+            .iter()
+            .map(|d| {
+                debug_assert!(
+                    d.device_id <= u16::MAX as u32,
+                    "device_id {} overflows u16",
+                    d.device_id
+                );
+                let device = d.device_id as u16;
+                if query_jid.is_lid() {
+                    Jid::lid_device(user.clone(), device)
+                } else {
+                    Jid::pn_device(user.clone(), device)
+                }
+            })
+            .collect()
     }
 
     /// Background loop placeholder for device registry cleanup.
@@ -211,7 +345,7 @@ impl Client {
     /// Device registry entries are managed through normal update/get operations.
     pub(super) async fn device_registry_cleanup_loop(&self) {
         // Simply wait for shutdown signal
-        self.shutdown_notifier.notified().await;
+        self.shutdown_notifier.listen().await;
         debug!(
             target: "Client/DeviceRegistry",
             "Shutdown signaled, exiting cleanup loop"
@@ -242,10 +376,8 @@ impl Client {
                     .insert(lid.to_string(), record)
                     .await;
 
-                // Invalidate both the string-keyed device_registry_cache AND the
-                // JID-keyed device cache. Using invalidate_device_cache ensures
-                // we clean up Jid::pn(pn) entries that would otherwise become stale.
-                self.invalidate_device_cache(pn).await;
+                // Clean up stale PN-keyed entry without touching the fresh LID entry.
+                self.device_registry_cache.invalidate(pn).await;
             }
             Ok(None) => {}
             Err(e) => {
@@ -393,28 +525,19 @@ mod tests {
         assert!(!client.has_device(lid, 99).await);
     }
 
-    /// Test that invalidate_device_cache uses correctly-typed JIDs.
-    ///
-    /// This test prevents a regression where the code was using both
-    /// Jid::pn(user) and Jid::lid(user) on the raw user string, which
-    /// creates invalid JIDs (e.g., "15551234567@lid" for a phone number).
-    ///
-    /// The fix uses the lid_pn_cache to determine the correct Jid type
-    /// for each lookup key.
+    /// Test that invalidate_device_cache clears registry cache entries for
+    /// all LID/PN aliases when called with either identifier.
     #[tokio::test]
     async fn test_invalidate_device_cache_uses_correct_jid_types() {
         use crate::lid_pn_cache::LidPnEntry;
-        use wacore_binary::jid::Jid;
 
         let client = create_test_client().await;
         let lid = "100000000000001";
         let pn = "15551234567";
 
-        // Set up LID-to-PN mapping
         let entry = LidPnEntry::new(lid.to_string(), pn.to_string(), LearningSource::Usync);
         client.lid_pn_cache.add(entry).await;
 
-        // Insert device registry record
         let record = wacore::store::traits::DeviceListRecord {
             user: lid.to_string(),
             devices: vec![wacore::store::traits::DeviceInfo {
@@ -429,52 +552,16 @@ mod tests {
             .insert(lid.to_string(), record)
             .await;
 
-        // Insert into device cache using correctly-typed JIDs
-        let lid_jid = Jid::lid(lid);
-        let pn_jid = Jid::pn(pn);
+        assert!(client.device_registry_cache.get(lid).await.is_some());
 
-        // Simulate devices being cached under both JID types
-        let device_cache = client.get_device_cache().await;
-        device_cache
-            .insert(lid_jid.clone(), vec![lid_jid.clone()])
-            .await;
-        device_cache
-            .insert(pn_jid.clone(), vec![pn_jid.clone()])
-            .await;
-
-        // Verify cache entries exist before invalidation
-        assert!(
-            client.device_registry_cache.get(lid).await.is_some(),
-            "Device registry cache should have LID entry before invalidation"
-        );
-        assert!(
-            device_cache.get(&lid_jid).await.is_some(),
-            "Device cache should have LID JID entry before invalidation"
-        );
-        assert!(
-            device_cache.get(&pn_jid).await.is_some(),
-            "Device cache should have PN JID entry before invalidation"
-        );
-
-        // Call invalidate_device_cache with the phone number (tests PN -> LID resolution)
+        // Invalidate via PN — should clear LID entry too (bidirectional resolution)
         client.invalidate_device_cache(pn).await;
-
-        // Verify all caches are properly invalidated
         assert!(
             client.device_registry_cache.get(lid).await.is_none(),
-            "Device registry cache should be invalidated for LID"
-        );
-        assert!(
-            device_cache.get(&lid_jid).await.is_none(),
-            "Device cache should be invalidated for LID JID"
-        );
-        assert!(
-            device_cache.get(&pn_jid).await.is_none(),
-            "Device cache should be invalidated for PN JID"
+            "LID entry should be invalidated when called with PN"
         );
 
-        // Also test invalidation when called with LID directly
-        // Re-insert entries
+        // Re-insert and invalidate via LID
         let record2 = wacore::store::traits::DeviceListRecord {
             user: lid.to_string(),
             devices: vec![wacore::store::traits::DeviceInfo {
@@ -488,98 +575,487 @@ mod tests {
             .device_registry_cache
             .insert(lid.to_string(), record2)
             .await;
-        device_cache
-            .insert(lid_jid.clone(), vec![lid_jid.clone()])
-            .await;
-        device_cache
-            .insert(pn_jid.clone(), vec![pn_jid.clone()])
-            .await;
 
-        // Call invalidate_device_cache with the LID
         client.invalidate_device_cache(lid).await;
-
-        // Verify all caches are properly invalidated
         assert!(
             client.device_registry_cache.get(lid).await.is_none(),
-            "Device registry cache should be invalidated for LID (called with LID)"
-        );
-        assert!(
-            device_cache.get(&lid_jid).await.is_none(),
-            "Device cache should be invalidated for LID JID (called with LID)"
-        );
-        assert!(
-            device_cache.get(&pn_jid).await.is_none(),
-            "Device cache should be invalidated for PN JID (called with LID)"
+            "LID entry should be invalidated when called with LID"
         );
     }
 
-    /// Test that invalidate_device_cache handles unknown users correctly.
-    ///
-    /// When a user has no LID-PN mapping, we don't know if it's a LID or PN.
-    /// The fix invalidates BOTH types to ensure we clean up regardless.
+    /// Test that invalidate_device_cache handles unknown users (no LID-PN mapping).
     #[tokio::test]
     async fn test_invalidate_device_cache_unknown_user_invalidates_both_types() {
-        use wacore_binary::jid::Jid;
-
         let client = create_test_client().await;
-        // This user has NO LID-PN mapping in the cache
         let unknown_user = "100000000000999";
 
-        // Create both possible JID types
-        let lid_jid = Jid::lid(unknown_user);
-        let pn_jid = Jid::pn(unknown_user);
-
-        // Simulate devices being cached under the LID type
-        // (this could happen if we queried usync with an @lid JID)
-        let device_cache = client.get_device_cache().await;
-        device_cache
-            .insert(lid_jid.clone(), vec![lid_jid.clone()])
+        let record = wacore::store::traits::DeviceListRecord {
+            user: unknown_user.to_string(),
+            devices: vec![wacore::store::traits::DeviceInfo {
+                device_id: 1,
+                key_index: None,
+            }],
+            timestamp: 12345,
+            phash: None,
+        };
+        client
+            .device_registry_cache
+            .insert(unknown_user.to_string(), record)
             .await;
 
-        // Verify cache entry exists
         assert!(
-            device_cache.get(&lid_jid).await.is_some(),
-            "Device cache should have LID JID entry before invalidation"
+            client
+                .device_registry_cache
+                .get(unknown_user)
+                .await
+                .is_some()
         );
 
-        // Call invalidate_device_cache with the unknown user
         client.invalidate_device_cache(unknown_user).await;
-
-        // Verify BOTH types are invalidated (even though only LID was cached)
         assert!(
-            device_cache.get(&lid_jid).await.is_none(),
-            "Device cache should be invalidated for LID JID (unknown user)"
+            client
+                .device_registry_cache
+                .get(unknown_user)
+                .await
+                .is_none(),
+            "Unknown user entry should be invalidated"
         );
-        assert!(
-            device_cache.get(&pn_jid).await.is_none(),
-            "Device cache should be invalidated for PN JID (unknown user)"
-        );
+    }
 
-        // Test the reverse case: PN cached but we don't know the type
-        let unknown_user2 = "15559998888";
-        let lid_jid2 = Jid::lid(unknown_user2);
-        let pn_jid2 = Jid::pn(unknown_user2);
+    // ── Granular patch tests ──────────────────────────────────────────────
 
-        // Simulate devices being cached under the PN type
-        device_cache
-            .insert(pn_jid2.clone(), vec![pn_jid2.clone()])
+    fn make_device_element(
+        device_id: u16,
+        key_index: Option<u32>,
+    ) -> wacore::stanza::devices::DeviceElement {
+        wacore::stanza::devices::DeviceElement {
+            jid: Jid {
+                user: "15551234567".into(),
+                server: "s.whatsapp.net".into(),
+                device: device_id,
+                ..Default::default()
+            },
+            key_index,
+            lid: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_patch_device_add_to_existing_cache() {
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+
+        let client = create_test_client().await;
+
+        // Pre-populate registry cache with device 0
+        let record = DeviceListRecord {
+            user: "15551234567".into(),
+            devices: vec![DeviceInfo {
+                device_id: 0,
+                key_index: None,
+            }],
+            timestamp: wacore::time::now_secs(),
+            phash: None,
+        };
+        client
+            .device_registry_cache
+            .insert("15551234567".into(), record)
             .await;
 
+        // Patch: add device 3
+        let elem = make_device_element(3, Some(5));
+        client.patch_device_add("15551234567", &elem).await;
+
+        let updated = client
+            .device_registry_cache
+            .get("15551234567")
+            .await
+            .unwrap();
+        assert_eq!(updated.devices.len(), 2);
+        assert!(updated.devices.iter().any(|d| d.device_id == 3));
+        let dev3 = updated.devices.iter().find(|d| d.device_id == 3).unwrap();
+        assert_eq!(dev3.key_index, Some(5));
+    }
+
+    #[tokio::test]
+    async fn test_patch_device_add_deduplicates() {
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+
+        let client = create_test_client().await;
+
+        let record = DeviceListRecord {
+            user: "15551234567".into(),
+            devices: vec![DeviceInfo {
+                device_id: 3,
+                key_index: None,
+            }],
+            timestamp: wacore::time::now_secs(),
+            phash: None,
+        };
+        client
+            .device_registry_cache
+            .insert("15551234567".into(), record)
+            .await;
+
+        // Patch: add device 3 again — should not duplicate
+        let elem = make_device_element(3, None);
+        client.patch_device_add("15551234567", &elem).await;
+
+        let updated = client
+            .device_registry_cache
+            .get("15551234567")
+            .await
+            .unwrap();
+        assert_eq!(updated.devices.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_patch_device_add_noop_on_miss() {
+        let client = create_test_client().await;
+
+        // No pre-populated cache — patch should be a no-op
+        let elem = make_device_element(3, None);
+        client.patch_device_add("15551234567", &elem).await;
+
         assert!(
-            device_cache.get(&pn_jid2).await.is_some(),
-            "Device cache should have PN JID entry before invalidation"
+            client
+                .device_registry_cache
+                .get("15551234567")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_patch_device_remove() {
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+
+        let client = create_test_client().await;
+
+        let record = DeviceListRecord {
+            user: "15551234567".into(),
+            devices: vec![
+                DeviceInfo {
+                    device_id: 0,
+                    key_index: None,
+                },
+                DeviceInfo {
+                    device_id: 3,
+                    key_index: None,
+                },
+            ],
+            timestamp: wacore::time::now_secs(),
+            phash: None,
+        };
+        client
+            .device_registry_cache
+            .insert("15551234567".into(), record)
+            .await;
+
+        client.patch_device_remove("15551234567", 3).await;
+
+        let updated = client
+            .device_registry_cache
+            .get("15551234567")
+            .await
+            .unwrap();
+        assert_eq!(updated.devices.len(), 1);
+        assert_eq!(updated.devices[0].device_id, 0);
+    }
+
+    #[tokio::test]
+    async fn test_patch_device_update_key_index() {
+        let client = create_test_client().await;
+
+        // Pre-populate registry cache
+        let record = wacore::store::traits::DeviceListRecord {
+            user: "15551234567".to_string(),
+            devices: vec![
+                wacore::store::traits::DeviceInfo {
+                    device_id: 0,
+                    key_index: None,
+                },
+                wacore::store::traits::DeviceInfo {
+                    device_id: 3,
+                    key_index: Some(1),
+                },
+            ],
+            timestamp: 1000,
+            phash: None,
+        };
+        client
+            .device_registry_cache
+            .insert("15551234567".to_string(), record)
+            .await;
+
+        // Patch: update device 3 key_index to 5
+        let elem = make_device_element(3, Some(5));
+        client.patch_device_update("15551234567", &elem).await;
+
+        let updated = client
+            .device_registry_cache
+            .get("15551234567")
+            .await
+            .unwrap();
+        let dev3 = updated.devices.iter().find(|d| d.device_id == 3).unwrap();
+        assert_eq!(dev3.key_index, Some(5));
+    }
+
+    #[tokio::test]
+    async fn test_patch_device_add_updates_registry() {
+        let client = create_test_client().await;
+
+        // Pre-populate registry cache
+        let record = wacore::store::traits::DeviceListRecord {
+            user: "15551234567".to_string(),
+            devices: vec![wacore::store::traits::DeviceInfo {
+                device_id: 0,
+                key_index: None,
+            }],
+            timestamp: 1000,
+            phash: None,
+        };
+        client
+            .device_registry_cache
+            .insert("15551234567".to_string(), record)
+            .await;
+
+        // Patch: add device 3
+        let elem = make_device_element(3, Some(2));
+        client.patch_device_add("15551234567", &elem).await;
+
+        let updated = client
+            .device_registry_cache
+            .get("15551234567")
+            .await
+            .unwrap();
+        assert_eq!(updated.devices.len(), 2);
+        let dev3 = updated.devices.iter().find(|d| d.device_id == 3).unwrap();
+        assert_eq!(dev3.key_index, Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_lid_migration_preserves_registry_cache() {
+        use crate::lid_pn_cache::LidPnEntry;
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+
+        let client = create_test_client().await;
+        let pn = "15550000099";
+        let lid = "100000000000099";
+
+        // Store device list under PN in backend
+        let record = DeviceListRecord {
+            user: pn.to_string(),
+            devices: vec![
+                DeviceInfo {
+                    device_id: 0,
+                    key_index: None,
+                },
+                DeviceInfo {
+                    device_id: 39,
+                    key_index: Some(25),
+                },
+            ],
+            timestamp: wacore::time::now_secs(),
+            phash: None,
+        };
+        client
+            .persistence_manager
+            .backend()
+            .update_device_list(record)
+            .await
+            .unwrap();
+
+        // Add LID-PN mapping so resolution works
+        let entry = LidPnEntry::new(lid.to_string(), pn.to_string(), LearningSource::Usync);
+        client.lid_pn_cache.add(entry).await;
+
+        // Migrate
+        client
+            .migrate_device_registry_on_lid_discovery(pn, lid)
+            .await;
+
+        // LID entry should exist in registry cache
+        let cached = client.device_registry_cache.get(lid).await;
+        assert!(
+            cached.is_some(),
+            "LID key should be in registry cache after migration"
+        );
+        assert_eq!(cached.unwrap().devices.len(), 2);
+
+        // PN entry should be gone
+        let pn_cached = client.device_registry_cache.get(pn).await;
+        assert!(
+            pn_cached.is_none(),
+            "PN key should be invalidated after migration"
         );
 
-        client.invalidate_device_cache(unknown_user2).await;
+        // get_devices_from_registry should find devices via LID lookup
+        let lid_jid = Jid::lid(lid);
+        let devices = client.get_devices_from_registry(&lid_jid).await;
+        assert!(devices.is_some(), "should resolve devices via LID");
+        assert_eq!(devices.unwrap().len(), 2);
+    }
 
-        // Verify BOTH types are invalidated
-        assert!(
-            device_cache.get(&lid_jid2).await.is_none(),
-            "Device cache should be invalidated for LID JID (unknown PN user)"
+    /// Regression: querying a LID-stored record by PN (and vice versa) must
+    /// return device JIDs whose user part matches the *query* alias, not the
+    /// storage key.
+    #[tokio::test]
+    async fn test_reconstruct_device_jids_uses_query_alias() {
+        use crate::lid_pn_cache::LidPnEntry;
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+
+        let client = create_test_client().await;
+        let pn = "15550000088";
+        let lid = "100000000000088";
+
+        // Store record under LID key
+        let record = DeviceListRecord {
+            user: lid.to_string(),
+            devices: vec![DeviceInfo {
+                device_id: 5,
+                key_index: None,
+            }],
+            timestamp: wacore::time::now_secs(),
+            phash: None,
+        };
+        client
+            .device_registry_cache
+            .insert(lid.to_string(), record)
+            .await;
+
+        // Add LID-PN mapping so bidirectional lookup works
+        let entry = LidPnEntry::new(lid.to_string(), pn.to_string(), LearningSource::Usync);
+        client.lid_pn_cache.add(entry).await;
+
+        // Query by PN — should find the LID-stored record but return PN-typed JIDs
+        let pn_jid = Jid::pn(pn);
+        let devices = client
+            .get_devices_from_registry(&pn_jid)
+            .await
+            .expect("should resolve LID record via PN alias");
+        assert_eq!(devices.len(), 1);
+        assert!(devices[0].is_pn(), "device JID should be PN-typed");
+        assert_eq!(
+            devices[0].user, pn,
+            "device JID user should be the PN, not the LID"
         );
+        assert_eq!(devices[0].device, 5);
+
+        // Query by LID — should return LID-typed JIDs
+        let lid_jid = Jid::lid(lid);
+        let devices = client
+            .get_devices_from_registry(&lid_jid)
+            .await
+            .expect("should resolve LID record via LID");
+        assert_eq!(devices.len(), 1);
+        assert!(devices[0].is_lid(), "device JID should be LID-typed");
+        assert_eq!(devices[0].user, lid, "device JID user should be the LID");
+    }
+
+    // ── DB-fallback tests for patch helpers ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_patch_device_add_falls_back_to_db() {
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+
+        let client = create_test_client().await;
+
+        // Seed backend DB directly (bypassing moka cache)
+        let record = DeviceListRecord {
+            user: "15551234567".into(),
+            devices: vec![DeviceInfo {
+                device_id: 0,
+                key_index: None,
+            }],
+            timestamp: wacore::time::now_secs(),
+            phash: None,
+        };
+        client
+            .persistence_manager
+            .backend()
+            .update_device_list(record)
+            .await
+            .unwrap();
+
+        // Moka cache is empty — old code would no-op here
         assert!(
-            device_cache.get(&pn_jid2).await.is_none(),
-            "Device cache should be invalidated for PN JID (unknown PN user)"
+            client
+                .device_registry_cache
+                .get("15551234567")
+                .await
+                .is_none()
         );
+
+        let elem = make_device_element(3, Some(7));
+        client.patch_device_add("15551234567", &elem).await;
+
+        // Verify patch was applied to DB (not silently dropped)
+        let updated = client
+            .persistence_manager
+            .backend()
+            .get_devices("15551234567")
+            .await
+            .unwrap()
+            .expect("record should still exist in DB");
+        assert_eq!(updated.devices.len(), 2);
+        assert!(updated.devices.iter().any(|d| d.device_id == 3));
+
+        // Cache should be warm now too
+        assert!(
+            client
+                .device_registry_cache
+                .get("15551234567")
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_patch_device_remove_falls_back_to_db() {
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+
+        let client = create_test_client().await;
+
+        let record = DeviceListRecord {
+            user: "15551234567".into(),
+            devices: vec![
+                DeviceInfo {
+                    device_id: 0,
+                    key_index: None,
+                },
+                DeviceInfo {
+                    device_id: 3,
+                    key_index: Some(5),
+                },
+            ],
+            timestamp: wacore::time::now_secs(),
+            phash: None,
+        };
+        client
+            .persistence_manager
+            .backend()
+            .update_device_list(record)
+            .await
+            .unwrap();
+
+        assert!(
+            client
+                .device_registry_cache
+                .get("15551234567")
+                .await
+                .is_none()
+        );
+
+        client.patch_device_remove("15551234567", 3).await;
+
+        let updated = client
+            .persistence_manager
+            .backend()
+            .get_devices("15551234567")
+            .await
+            .unwrap()
+            .expect("record should still exist");
+        assert_eq!(updated.devices.len(), 1);
+        assert_eq!(updated.devices[0].device_id, 0);
     }
 }

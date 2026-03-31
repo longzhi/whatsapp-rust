@@ -1,33 +1,149 @@
 //! E2E Session management for Client.
 
 use anyhow::Result;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use wacore::libsignal::store::SessionStore;
 use wacore::types::jid::JidExt;
 use wacore_binary::jid::Jid;
 
 use super::Client;
+use crate::types::events::{Event, OfflineSyncCompleted};
 
 impl Client {
+    /// WA Web: `WAWebOfflineResumeConst.OFFLINE_STANZA_TIMEOUT_MS = 60000`
+    pub(crate) const DEFAULT_OFFLINE_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
+
+    pub(crate) fn complete_offline_sync(&self, count: i32) {
+        self.offline_sync_metrics
+            .active
+            .store(false, Ordering::Release);
+        match self.offline_sync_metrics.start_time.lock() {
+            Ok(mut guard) => *guard = None,
+            Err(poison) => *poison.into_inner() = None,
+        }
+
+        // Signal that offline sync is complete - post-login tasks are waiting for this.
+        // This mimics WhatsApp Web's offlineDeliveryEnd event.
+        // Use compare_exchange to ensure we only run this once (add_permits is NOT idempotent).
+        // Install the wider semaphore BEFORE flipping the flag so that any thread
+        // observing offline_sync_completed=true already sees the 64-permit semaphore.
+        if self
+            .offline_sync_completed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // Allow parallel message processing now that offline sync is done.
+            // During offline sync, permits=1 serialized all message processing.
+            // Replace with a new semaphore with 64 permits for concurrent processing.
+            // Old workers holding the previous semaphore Arc will finish normally.
+            self.swap_message_semaphore(64);
+
+            self.offline_sync_notifier.notify(usize::MAX);
+
+            self.core
+                .event_bus
+                .dispatch(&Event::OfflineSyncCompleted(OfflineSyncCompleted { count }));
+        }
+    }
+
     /// Wait for offline message delivery to complete (with timeout).
     pub(crate) async fn wait_for_offline_delivery_end(&self) {
-        use std::sync::atomic::Ordering;
+        self.wait_for_offline_delivery_end_with_timeout(Self::DEFAULT_OFFLINE_SYNC_TIMEOUT)
+            .await;
+    }
 
+    pub(crate) async fn wait_for_offline_delivery_end_with_timeout(&self, timeout: Duration) {
+        let wait_generation = self.connection_generation.load(Ordering::Acquire);
+        let offline_fut = self.offline_sync_notifier.listen();
         if self.offline_sync_completed.load(Ordering::Relaxed) {
             return;
         }
 
-        const TIMEOUT_SECS: u64 = 10;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(TIMEOUT_SECS),
-            self.offline_sync_notifier.notified(),
-        )
-        .await;
+        if wacore::runtime::timeout(&*self.runtime, timeout, offline_fut)
+            .await
+            .is_err()
+        {
+            // Guard: don't complete sync for a stale connection generation.
+            // A reconnect may have happened while we were waiting, making this
+            // timeout belong to the old connection.
+            if self.connection_generation.load(Ordering::Acquire) != wait_generation
+                || self.expected_disconnect.load(Ordering::Relaxed)
+            {
+                log::debug!(
+                    target: "Client/OfflineSync",
+                    "Offline sync timeout ignored: connection generation changed or disconnected",
+                );
+                return;
+            }
+
+            let processed = self
+                .offline_sync_metrics
+                .processed_messages
+                .load(Ordering::Acquire);
+            let expected = self
+                .offline_sync_metrics
+                .total_messages
+                .load(Ordering::Acquire);
+            log::warn!(
+                target: "Client/OfflineSync",
+                "Offline sync timed out after {:?} (processed {} of {} items); marking sync complete",
+                timeout,
+                processed,
+                expected,
+            );
+            self.complete_offline_sync(i32::try_from(processed).unwrap_or(i32::MAX));
+        }
+    }
+
+    pub(crate) fn begin_history_sync_task(&self) {
+        self.history_sync_tasks_in_flight
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn finish_history_sync_task(&self) {
+        let previous = self
+            .history_sync_tasks_in_flight
+            .fetch_sub(1, Ordering::Relaxed);
+        if previous <= 1 {
+            self.history_sync_tasks_in_flight
+                .store(0, Ordering::Relaxed);
+            self.history_sync_idle_notifier.notify(usize::MAX);
+        }
+    }
+
+    pub async fn wait_for_startup_sync(&self, timeout: std::time::Duration) -> Result<()> {
+        use anyhow::anyhow;
+        use wacore::time::Instant;
+
+        let deadline = Instant::now() + timeout;
+
+        // Register the notified future *before* checking state to avoid missing
+        // a notify_waiters() that fires between the check and the await.
+        let offline_fut = self.offline_sync_notifier.listen();
+        if !self.offline_sync_completed.load(Ordering::Relaxed) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            wacore::runtime::timeout(&*self.runtime, remaining, offline_fut)
+                .await
+                .map_err(|_| anyhow!("Timeout waiting for offline sync completion"))?;
+        }
+
+        loop {
+            let history_fut = self.history_sync_idle_notifier.listen();
+            if self.history_sync_tasks_in_flight.load(Ordering::Relaxed) == 0 {
+                return Ok(());
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            wacore::runtime::timeout(&*self.runtime, remaining, history_fut)
+                .await
+                .map_err(|_| anyhow!("Timeout waiting for history sync tasks to become idle"))?;
+        }
     }
 
     /// Ensure E2E sessions exist for the given device JIDs.
     /// Waits for offline delivery, resolves LID mappings, then batches prekey fetches.
-    pub(crate) async fn ensure_e2e_sessions(&self, device_jids: Vec<Jid>) -> Result<()> {
-        use wacore::libsignal::store::SessionStore;
+    pub(crate) async fn ensure_e2e_sessions(&self, device_jids: &[Jid]) -> Result<()> {
         use wacore::types::jid::JidExt;
 
         if device_jids.is_empty() {
@@ -35,7 +151,7 @@ impl Client {
         }
 
         self.wait_for_offline_delivery_end().await;
-        let resolved_jids = self.resolve_lid_mappings(&device_jids).await;
+        let resolved_jids = self.resolve_lid_mappings(device_jids).await;
 
         let device_store = self.persistence_manager.get_device_arc().await;
         let mut jids_needing_sessions = Vec::with_capacity(resolved_jids.len());
@@ -44,7 +160,12 @@ impl Client {
             let device_guard = device_store.read().await;
             for jid in resolved_jids {
                 let signal_addr = jid.to_protocol_address();
-                match device_guard.contains_session(&signal_addr).await {
+                // Check cache first (includes unflushed sessions), fall back to backend
+                match self
+                    .signal_cache
+                    .has_session(&signal_addr, &*device_guard.backend)
+                    .await
+                {
                     Ok(true) => {}
                     Ok(false) => jids_needing_sessions.push(jid),
                     Err(e) => log::warn!("Failed to check session for {}: {}", jid, e),
@@ -66,7 +187,6 @@ impl Client {
     /// Fetch prekeys and establish sessions for a batch of JIDs.
     /// Returns the number of sessions successfully established.
     async fn fetch_and_establish_sessions(&self, jids: &[Jid]) -> Result<usize, anyhow::Error> {
-        use rand::TryRngCore;
         use wacore::libsignal::protocol::{UsePQRatchet, process_prekey_bundle};
         use wacore::types::jid::JidExt;
 
@@ -74,11 +194,15 @@ impl Client {
             return Ok(0);
         }
 
-        let prekey_bundles = self.fetch_pre_keys(jids, Some("identity")).await?;
+        let prekey_bundles = self
+            .fetch_pre_keys(jids, Some(wacore::iq::prekeys::PreKeyFetchReason::Identity))
+            .await?;
 
         let device_store = self.persistence_manager.get_device_arc().await;
-        let mut adapter =
-            crate::store::signal_adapter::SignalProtocolStoreAdapter::new(device_store);
+        let mut adapter = crate::store::signal_adapter::SignalProtocolStoreAdapter::new(
+            device_store,
+            self.signal_cache.clone(),
+        );
 
         let mut success_count = 0;
         let mut missing_count = 0;
@@ -87,12 +211,22 @@ impl Client {
         for jid in jids {
             if let Some(bundle) = prekey_bundles.get(&jid.normalize_for_prekey_bundle()) {
                 let signal_addr = jid.to_protocol_address();
+
+                // Acquire per-sender session lock to prevent race with concurrent message decryption.
+                let session_mutex = self
+                    .session_locks
+                    .get_with_by_ref(signal_addr.as_str(), async {
+                        std::sync::Arc::new(async_lock::Mutex::new(()))
+                    })
+                    .await;
+                let _session_guard = session_mutex.lock().await;
+
                 match process_prekey_bundle(
                     &signal_addr,
                     &mut adapter.session_store,
                     &mut adapter.identity_store,
                     bundle,
-                    &mut rand::rngs::OsRng.unwrap_err(),
+                    &mut rand::make_rng::<rand::rngs::StdRng>(),
                     UsePQRatchet::No,
                 )
                 .await
@@ -126,6 +260,11 @@ impl Client {
             );
         }
 
+        // Flush after all sessions established
+        if success_count > 0 {
+            self.flush_signal_cache().await?;
+        }
+
         Ok(success_count)
     }
 
@@ -144,7 +283,7 @@ impl Client {
         let own_pn = device_snapshot
             .pn
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("Not logged in - no phone number available"))?;
+            .ok_or_else(|| anyhow::Error::from(crate::client::ClientError::NotLoggedIn))?;
 
         let primary_phone_pn = own_pn.with_device(0);
         let primary_phone_lid = device_snapshot.lid.as_ref().map(|lid| lid.with_device(0));
@@ -392,7 +531,7 @@ mod tests {
         };
 
         // Apply filter logic (matching ensure_e2e_sessions behavior)
-        let mut jids_needing_sessions = Vec::new();
+        let mut jids_needing_sessions = Vec::with_capacity(jids.len());
         for jid in &jids {
             match session_exists(jid) {
                 Ok(true) => {}                                        // Skip - session exists
@@ -410,7 +549,7 @@ mod tests {
 
     #[test]
     fn test_dual_addressing_pn_and_lid_are_independent() {
-        let pn_address = Jid::pn("559984726662").with_device(0);
+        let pn_address = Jid::pn("551199887766").with_device(0);
         let lid_address = Jid::lid("236395184570386").with_device(0);
 
         assert_ne!(pn_address.user, lid_address.user);
@@ -421,7 +560,7 @@ mod tests {
         let lid_signal_addr = lid_address.to_protocol_address();
 
         assert_ne!(pn_signal_addr.name(), lid_signal_addr.name());
-        assert_eq!(pn_signal_addr.name(), "559984726662@c.us");
+        assert_eq!(pn_signal_addr.name(), "551199887766@c.us");
         assert_eq!(lid_signal_addr.name(), "236395184570386@lid");
         assert_eq!(pn_address.device, 0);
         assert_eq!(lid_address.device, 0);
