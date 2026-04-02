@@ -32,8 +32,9 @@ use rand::{Rng, RngExt};
 use scopeguard;
 use wacore_binary::jid::Jid;
 
+use portable_atomic::AtomicU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 /// Filter for matching incoming stanzas (nodes) by tag and attributes.
 ///
@@ -355,6 +356,8 @@ pub struct Client {
 
     pub(crate) sender_key_device_cache: crate::sender_key_device_cache::SenderKeyDeviceCache,
 
+    pub(crate) pending_device_sync: crate::pending_device_sync::PendingDeviceSync,
+
     pub(crate) pending_retries: Arc<std::sync::Mutex<HashSet<String>>>,
 
     /// Track retry attempts per message to prevent infinite retry loops.
@@ -446,6 +449,14 @@ pub struct Client {
     /// Cache configuration for TTL and capacity of all caches.
     /// Stored for use by lazily-initialized caches (group_cache).
     pub(crate) cache_config: CacheConfig,
+
+    /// Weak self-reference for spawning background tasks from `&self` methods.
+    /// Initialized after `Arc::new(this)` in the constructor.
+    pub(crate) self_weak: std::sync::OnceLock<std::sync::Weak<Client>>,
+
+    /// When true, emit `Event::RawNode` for every decoded stanza before router dispatch.
+    /// Default false — only enable when external consumers need raw protocol access.
+    raw_node_forwarding: AtomicBool,
 }
 
 impl Client {
@@ -652,6 +663,8 @@ impl Client {
                 &cache_config.sender_key_devices_cache,
             ),
 
+            pending_device_sync: crate::pending_device_sync::PendingDeviceSync::new(),
+
             pending_retries: Arc::new(std::sync::Mutex::new(HashSet::new())),
 
             message_retry_counts: cache_config.message_retry_counts.build_with_ttl(),
@@ -699,9 +712,12 @@ impl Client {
             override_version,
             skip_history_sync: AtomicBool::new(false),
             cache_config,
+            self_weak: std::sync::OnceLock::new(),
+            raw_node_forwarding: AtomicBool::new(false),
         };
 
         let arc = Arc::new(this);
+        let _ = arc.self_weak.set(Arc::downgrade(&arc));
 
         // Warm up the LID-PN cache from persistent storage
         let warm_up_arc = arc.clone();
@@ -793,6 +809,75 @@ impl Client {
         self.core.event_bus.add_handler(handler);
     }
 
+    /// Enable or disable raw node forwarding.
+    /// When enabled, `Event::RawNode` is emitted for every decoded stanza before
+    /// the stanza router dispatches it. Only enable when external consumers need
+    /// raw protocol access (e.g. voice call stanzas).
+    pub fn set_raw_node_forwarding(&self, enabled: bool) {
+        self.raw_node_forwarding.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Build a [`SignalProtocolStoreAdapter`] from the current device state and signal cache.
+    pub(crate) async fn signal_adapter(
+        &self,
+    ) -> crate::store::signal_adapter::SignalProtocolStoreAdapter {
+        let device_store = self.persistence_manager.get_device_arc().await;
+        self.signal_adapter_from(device_store)
+    }
+
+    /// Build a [`SignalProtocolStoreAdapter`] from a pre-fetched device arc.
+    pub(crate) fn signal_adapter_from(
+        &self,
+        device_store: Arc<async_lock::RwLock<crate::store::Device>>,
+    ) -> crate::store::signal_adapter::SignalProtocolStoreAdapter {
+        crate::store::signal_adapter::SignalProtocolStoreAdapter::new(
+            device_store,
+            self.signal_cache.clone(),
+        )
+    }
+
+    /// Get the per-address session mutex from the lock cache.
+    pub(crate) async fn session_lock_for(
+        &self,
+        signal_addr_str: &str,
+    ) -> Arc<async_lock::Mutex<()>> {
+        self.session_locks
+            .get_with_by_ref(signal_addr_str, async {
+                Arc::new(async_lock::Mutex::new(()))
+            })
+            .await
+    }
+
+    /// Get the active noise socket, or error if not connected.
+    pub(crate) async fn get_noise_socket(
+        &self,
+    ) -> Result<Arc<crate::socket::noise_socket::NoiseSocket>, ClientError> {
+        self.noise_socket
+            .lock()
+            .await
+            .clone()
+            .ok_or(ClientError::NotConnected)
+    }
+
+    /// Send pre-marshaled plaintext bytes through the noise socket.
+    ///
+    /// The bytes must be a valid WABinary-marshaled stanza (as produced by
+    /// `wacore_binary::marshal::marshal_to`). Sending malformed data will
+    /// cause the server to close the connection.
+    ///
+    /// This bypasses node logging and `sent_node_waiter` resolution — use
+    /// [`send_node`](Client::send_node) for normal stanza sending.
+    pub async fn send_raw_bytes(&self, plaintext: Vec<u8>) -> Result<(), ClientError> {
+        let noise_socket = self.get_noise_socket().await?;
+        let encrypted_buf = Vec::with_capacity(plaintext.len() + 32);
+        noise_socket
+            .encrypt_and_send(plaintext, encrypted_buf)
+            .await?;
+        self.last_data_sent_ms
+            .store(wacore::time::now_millis().max(0) as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Register a chatstate handler which will be invoked when a `<chatstate>` stanza is received.
     ///
     /// The handler receives a `ChatStateEvent` with the parsed chat state information.
@@ -871,7 +956,14 @@ impl Client {
             self.expected_disconnect.store(false, Ordering::Relaxed);
 
             if let Err(connect_err) = self.connect().await {
-                error!("Failed to connect: {connect_err:#}. Will retry...");
+                let is_transient = connect_err
+                    .downcast_ref::<crate::handshake::HandshakeError>()
+                    .is_some_and(|e| e.is_transient());
+                if is_transient {
+                    debug!("Transient connect failure, will retry: {connect_err:#}");
+                } else {
+                    error!("Failed to connect: {connect_err:#}. Will retry...");
+                }
             } else {
                 let unexpected_disconnect = if self.read_messages_loop().await.is_err() {
                     // Check intentional_reconnect AFTER read loop exits — reconnect()
@@ -986,13 +1078,20 @@ impl Client {
 
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
 
-        let noise_socket = handshake::do_handshake(
+        let noise_socket = match handshake::do_handshake(
             self.runtime.clone(),
             &device_snapshot,
             transport.clone(),
             &mut transport_events,
         )
-        .await?;
+        .await
+        {
+            Ok(socket) => socket,
+            Err(e) => {
+                transport.disconnect().await;
+                return Err(e.into());
+            }
+        };
 
         *self.transport.lock().await = Some(transport);
         *self.transport_events.lock().await = Some(transport_events);
@@ -1135,6 +1234,7 @@ impl Client {
         // connection don't trigger an immediate reconnect on the next one.
         self.last_data_received_ms.store(0, Ordering::Relaxed);
         self.last_data_sent_ms.store(0, Ordering::Relaxed);
+        self.pending_device_sync.clear().await;
         // Reset offline sync state for next connection
         self.offline_sync_completed.store(false, Ordering::Relaxed);
         self.offline_sync_metrics
@@ -1343,10 +1443,9 @@ impl Client {
         self: &Arc<Self>,
         encrypted_frame: &bytes::Bytes,
     ) -> Option<wacore_binary::node::Node> {
-        let noise_socket_arc = { self.noise_socket.lock().await.clone() };
-        let noise_socket = match noise_socket_arc {
-            Some(s) => s,
-            None => {
+        let noise_socket = match self.get_noise_socket().await {
+            Ok(s) => s,
+            Err(_) => {
                 log::error!("Cannot process frame: not connected (no noise socket)");
                 return None;
             }
@@ -1489,6 +1588,14 @@ impl Client {
         // Prepare deferred ACK cancellation flag (sent after dispatch unless cancelled)
         let mut cancelled = false;
 
+        // Emit raw node before any early returns so all decoded stanzas
+        // (including IQ responses and xmlstreamend) reach external observers
+        if self.raw_node_forwarding.load(Ordering::Relaxed) {
+            self.core
+                .event_bus
+                .dispatch(&Event::RawNode(Arc::clone(&node)));
+        }
+
         if node.tag.as_ref() == "xmlstreamend" {
             if self.expected_disconnect.load(Ordering::Relaxed) {
                 debug!("Received <xmlstreamend/>, expected disconnect.");
@@ -1500,7 +1607,7 @@ impl Client {
         }
 
         // Check generic node waiters (zero-cost when none registered)
-        if self.node_waiter_count.load(Ordering::Relaxed) > 0 {
+        if self.node_waiter_count.load(Ordering::Acquire) > 0 {
             self.resolve_node_waiters(&node);
         }
 
@@ -1551,10 +1658,11 @@ impl Client {
             }
         } else {
             let this = self.clone();
-            // Node is already in Arc - just clone the Arc (cheap), not the Node
             self.runtime
                 .spawn(Box::pin(async move {
-                    if let Err(e) = this.send_ack_for(&node).await {
+                    if let Err(e) = this.send_ack_for(&node).await
+                        && !matches!(e, ClientError::NotConnected)
+                    {
                         warn!("Failed to send ack: {e:?}");
                     }
                 }))
@@ -1842,8 +1950,12 @@ impl Client {
                 // Don't fail login - PDO will retry via ensure_e2e_sessions fallback
             }
 
-            // === Passive Tasks (mimics WhatsApp Web's PassiveTaskManager) ===
-            // WhatsApp Web executes passive tasks (like PreKey upload) BEFORE sending the active IQ.
+            // Sync own device list so DM fan-out includes all companions
+            check_generation!();
+            if let Err(e) = client_clone.sync_own_device_list().await {
+                client_clone.log_sync_error("sync own device list", &e);
+            }
+
             check_generation!();
             if !client_clone.is_connected() {
                 debug!("Skipping passive tasks: connection closed");
@@ -2095,6 +2207,32 @@ impl Client {
     /// If an ack with an ID that matches a pending task in `response_waiters`,
     /// the task is resolved and the function returns `true`. Otherwise, returns `false`.
     pub(crate) async fn handle_ack_response(&self, node: Node) -> bool {
+        // Surface privacy-token nack codes for diagnosability
+        if let Some(error_code) = node.attrs.get("error") {
+            let code = error_code.as_str();
+            let id = node.attrs.get("id").map(|v| v.as_str().into_owned());
+            match &*code {
+                "463" => {
+                    warn!(
+                        target: "Client/Ack",
+                        "Received 463 (MissingTcToken) nack for msg {:?}. \
+                         The recipient requires a valid tctoken or cstoken. \
+                         This may indicate a reachout timelock on the account.",
+                        id
+                    );
+                }
+                "479" => {
+                    warn!(
+                        target: "Client/Ack",
+                        "Received 479 (SmaxInvalid) nack for msg {:?}. \
+                         A stanza field has an incorrect format (e.g. wrong JID format or content type).",
+                        id
+                    );
+                }
+                _ => {}
+            }
+        }
+
         let id_opt = node.attrs.get("id").map(|v| v.as_str().into_owned());
         if let Some(id) = id_opt
             && let Some(waiter) = self.response_waiters.lock().await.remove(&id)
@@ -3297,39 +3435,18 @@ impl Client {
     }
 
     pub async fn send_node(&self, node: Node) -> Result<(), ClientError> {
-        let noise_socket_arc = { self.noise_socket.lock().await.clone() };
-        let noise_socket = match noise_socket_arc {
-            Some(socket) => socket,
-            None => return Err(ClientError::NotConnected),
-        };
-
         debug!(target: "Client/Send", "{}", DisplayableNode(&node));
         if self.sent_node_waiter_count.load(Ordering::Acquire) > 0 {
             self.resolve_sent_node_waiters(&Arc::new(node.clone()));
         }
 
         let mut plaintext_buf = Vec::with_capacity(1024);
-
         if let Err(e) = wacore_binary::marshal::marshal_to(&node, &mut plaintext_buf) {
             error!("Failed to marshal node: {e:?}");
             return Err(SocketError::Crypto("Marshal error".to_string()).into());
         }
 
-        // Size based on plaintext + encryption overhead (16 byte tag + 3 byte frame header)
-        let encrypted_buf = Vec::with_capacity(plaintext_buf.len() + 32);
-
-        if let Err(e) = noise_socket
-            .encrypt_and_send(plaintext_buf, encrypted_buf)
-            .await
-        {
-            return Err(e.into());
-        }
-
-        // WA Web: callStanza → deadSocketTimer.onOrBefore(deadSocketTime, socketId)
-        self.last_data_sent_ms
-            .store(wacore::time::now_millis().max(0) as u64, Ordering::Relaxed);
-
-        Ok(())
+        self.send_raw_bytes(plaintext_buf).await
     }
 
     pub(crate) async fn update_push_name_and_notify(self: &Arc<Self>, new_name: String) {

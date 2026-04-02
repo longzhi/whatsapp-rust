@@ -310,14 +310,33 @@ pub struct SignalStores<'a, S, I, P, SP> {
     pub signed_prekey_store: &'a SP,
 }
 
-async fn encrypt_for_devices<'a, S, I, P, SP>(
+/// Check if an anyhow error is a 406 "not-acceptable" server error (device unregistered).
+/// Uses typed downcast to `ServerErrorCode` — the shared error type that the
+/// `SendContextResolver` impl wraps server errors in.
+pub(crate) fn is_device_unregistered_error(err: &anyhow::Error) -> bool {
+    crate::request::ServerErrorCode::from_anyhow(err).is_some_and(|e| e.code == 406)
+}
+
+pub struct EncryptResult {
+    pub participant_nodes: Vec<Node>,
+    pub includes_prekey_message: bool,
+    pub encrypted_devices: Vec<Jid>,
+    /// True if any device returned 406 (unregistered) during prekey fetch.
+    pub had_unregistered_device: bool,
+}
+
+/// Encrypt padded plaintext for each device JID, producing participant `<to>` nodes.
+///
+/// Callers must hold per-device session locks before calling this function —
+/// concurrent ratchet mutations will corrupt Signal session state.
+pub async fn encrypt_for_devices<'a, S, I, P, SP>(
     stores: &mut SignalStores<'a, S, I, P, SP>,
     resolver: &dyn SendContextResolver,
     devices: &[Jid],
     plaintext_to_encrypt: &[u8],
     hide_decrypt_fail: bool,
     mediatype: Option<&str>,
-) -> Result<(Vec<Node>, bool, Vec<Jid>)>
+) -> Result<EncryptResult>
 where
     S: crate::libsignal::protocol::SessionStore + Send + Sync,
     I: crate::libsignal::protocol::IdentityKeyStore + Send + Sync,
@@ -331,6 +350,7 @@ where
     let mut jid_to_encryption_jid: std::collections::HashMap<Jid, Jid> =
         std::collections::HashMap::with_capacity(devices.len());
     let mut jids_needing_prekeys = Vec::with_capacity(devices.len());
+    let mut had_406 = false;
 
     for device_jid in devices {
         // WhatsApp Web's SignalAddress.toString() normalizes PN → LID before
@@ -401,9 +421,49 @@ where
             "Fetching prekeys for {} devices without sessions",
             jids_needing_prekeys.len()
         );
-        let prekey_bundles = resolver
+        // WA Web's fetchPrekeys() collects per-device errors separately and returns
+        // successful bundles. On batch 406, retry per-device so one stale device
+        // doesn't blank valid companions in the same batch.
+        let prekey_bundles = match resolver
             .fetch_prekeys_for_identity_check(&jids_needing_prekeys)
-            .await?;
+            .await
+        {
+            Ok(bundles) => bundles,
+            Err(e) if is_device_unregistered_error(&e) => {
+                if jids_needing_prekeys.len() == 1 {
+                    log::warn!(
+                        "Prekey fetch returned 406 (device unregistered): {}",
+                        jids_needing_prekeys[0]
+                    );
+                    had_406 = true;
+                    std::collections::HashMap::new()
+                } else {
+                    // Batch failed: retry per-device to salvage valid ones
+                    log::warn!(
+                        "Batch prekey fetch returned 406 for {} devices, retrying individually",
+                        jids_needing_prekeys.len()
+                    );
+                    let mut bundles = std::collections::HashMap::new();
+                    for jid in &jids_needing_prekeys {
+                        match resolver
+                            .fetch_prekeys_for_identity_check(std::slice::from_ref(jid))
+                            .await
+                        {
+                            Ok(single) => bundles.extend(single),
+                            Err(e) if is_device_unregistered_error(&e) => {
+                                log::warn!("Device {jid} returned 406, skipping");
+                                had_406 = true;
+                            }
+                            Err(e) => {
+                                log::warn!("Prekey fetch for {jid} failed: {e}, skipping");
+                            }
+                        }
+                    }
+                    bundles
+                }
+            }
+            Err(e) => return Err(e),
+        };
 
         for device_jid in &jids_needing_prekeys {
             // Use the LID-normalized encryption JID for session creation
@@ -583,11 +643,12 @@ where
         }
     }
 
-    Ok((
+    Ok(EncryptResult {
         participant_nodes,
         includes_prekey_message,
         encrypted_devices,
-    ))
+        had_unregistered_device: had_406,
+    })
 }
 
 fn is_exact_dm_sender_device(device_jid: &Jid, own_jid: &Jid, own_lid: Option<&Jid>) -> bool {
@@ -652,7 +713,7 @@ pub async fn prepare_dm_stanza<
     let dsm = wa::Message {
         device_sent_message: Some(Box::new(DeviceSentMessage {
             destination_jid: Some(to_jid.to_string()),
-            message: Some(Box::new(message_for_encryption.clone())),
+            message: Some(Box::new(message_for_encryption)),
             phash: Some("".to_string()),
         })),
         ..Default::default()
@@ -675,7 +736,7 @@ pub async fn prepare_dm_stanza<
     let mediatype = media_type_from_message(message);
 
     if !recipient_devices.is_empty() {
-        let (nodes, inc, _) = encrypt_for_devices(
+        let result = encrypt_for_devices(
             stores,
             resolver,
             &recipient_devices,
@@ -684,12 +745,12 @@ pub async fn prepare_dm_stanza<
             mediatype,
         )
         .await?;
-        participant_nodes.extend(nodes);
-        includes_prekey_message = includes_prekey_message || inc;
+        participant_nodes.extend(result.participant_nodes);
+        includes_prekey_message = includes_prekey_message || result.includes_prekey_message;
     }
 
     if !own_other_devices.is_empty() {
-        let (nodes, inc, _) = encrypt_for_devices(
+        let result = encrypt_for_devices(
             stores,
             resolver,
             &own_other_devices,
@@ -698,8 +759,8 @@ pub async fn prepare_dm_stanza<
             mediatype,
         )
         .await?;
-        participant_nodes.extend(nodes);
-        includes_prekey_message = includes_prekey_message || inc;
+        participant_nodes.extend(result.participant_nodes);
+        includes_prekey_message = includes_prekey_message || result.includes_prekey_message;
     }
 
     let mut message_content_nodes = vec![
@@ -863,9 +924,12 @@ where
 /// tracking without re-resolving devices.
 pub struct PreparedGroupStanza {
     pub node: Node,
-    /// Devices that received SKDM in this stanza. Empty when no SKDM was distributed
-    /// (e.g., all devices already have the sender key).
+    /// Devices that actually received SKDM (successfully encrypted).
     pub skdm_devices: Vec<Jid>,
+    /// Users whose device registry should be invalidated because their
+    /// devices returned 406 (unregistered) during SKDM prekey fetch.
+    /// Empty when no 406 occurred.
+    pub stale_device_users: Vec<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -917,7 +981,7 @@ pub async fn prepare_group_stanza<
 
     let mut message_children: Vec<Node> = Vec::new();
     let mut includes_prekey_message = false;
-    let mut resolved_devices_for_phash: Option<Vec<Jid>> = None;
+    let mut phash_for_stanza: Option<String> = None;
     let mut skdm_encrypted_devices: Vec<Jid> = Vec::new();
 
     // Determine if we need to distribute SKDM and to which devices
@@ -1042,8 +1106,15 @@ pub async fn prepare_group_stanza<
         None
     };
 
+    let mut had_unregistered_devices = false;
+
     if let Some(ref distribution_list) = distribution_list {
-        resolved_devices_for_phash = Some(distribution_list.clone());
+        // WA Web computes phash from the full distribution list (target set at
+        // send time), not the actual encrypted outcome
+        match MessageUtils::participant_list_hash(distribution_list) {
+            Ok(phash) => phash_for_stanza = Some(phash),
+            Err(e) => log::warn!("Failed to compute phash for group {}: {:?}", to_jid, e),
+        }
         let axolotl_skdm_bytes = create_sender_key_distribution_message_for_group(
             stores.sender_key_store,
             &to_jid,
@@ -1061,7 +1132,10 @@ pub async fn prepare_group_stanza<
         let skdm_plaintext_to_encrypt =
             MessageUtils::pad_message_v2(skdm_wrapper_msg.encode_to_vec());
 
-        let (participant_nodes, inc, actually_encrypted) = encrypt_for_devices(
+        // WA Web's GroupSkmsgJob wraps ensureE2ESessions in try/catch — logs error
+        // but does NOT rethrow. SKDM distribution failure must not prevent the group
+        // message from being sent. Only successfully encrypted devices are tracked.
+        match encrypt_for_devices(
             stores,
             resolver,
             distribution_list,
@@ -1069,22 +1143,39 @@ pub async fn prepare_group_stanza<
             true,
             None,
         )
-        .await?;
-        includes_prekey_message = includes_prekey_message || inc;
-        skdm_encrypted_devices = actually_encrypted;
+        .await
+        {
+            Ok(result) => {
+                includes_prekey_message = includes_prekey_message || result.includes_prekey_message;
+                if result.had_unregistered_device {
+                    had_unregistered_devices = true;
+                }
+                skdm_encrypted_devices = result.encrypted_devices;
 
-        // Add participants list as part of the single hybrid stanza
-        message_children.push(
-            NodeBuilder::new("participants")
-                .children(participant_nodes)
-                .build(),
-        );
-        if includes_prekey_message && let Some(acc) = account {
-            message_children.push(
-                NodeBuilder::new("device-identity")
-                    .bytes(acc.encode_to_vec())
-                    .build(),
-            );
+                if !result.participant_nodes.is_empty() {
+                    message_children.push(
+                        NodeBuilder::new("participants")
+                            .children(result.participant_nodes)
+                            .build(),
+                    );
+                    if includes_prekey_message && let Some(acc) = account {
+                        message_children.push(
+                            NodeBuilder::new("device-identity")
+                                .bytes(acc.encode_to_vec())
+                                .build(),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "SKDM distribution failed for group {}, continuing without it: {e}",
+                    to_jid
+                );
+                if is_device_unregistered_error(&e) {
+                    had_unregistered_devices = true;
+                }
+            }
         }
     }
 
@@ -1143,15 +1234,8 @@ pub async fn prepare_group_stanza<
     }
 
     // Add phash if we distributed keys in this message
-    if let Some(devices) = &resolved_devices_for_phash {
-        match MessageUtils::participant_list_hash(devices) {
-            Ok(phash) => {
-                stanza_builder = stanza_builder.attr("phash", phash);
-            }
-            Err(e) => {
-                log::warn!("Failed to compute phash for group {}: {:?}", to_jid, e);
-            }
-        }
+    if let Some(phash) = phash_for_stanza {
+        stanza_builder = stanza_builder.attr("phash", phash);
     }
 
     // Add any extra stanza nodes provided by the caller
@@ -1159,9 +1243,27 @@ pub async fn prepare_group_stanza<
 
     let stanza = stanza_builder.children(message_children).build();
 
+    // Collect deduplicated users whose devices failed SKDM (were in
+    // distribution_list but not in skdm_encrypted_devices)
+    let stale_users = if had_unregistered_devices {
+        let encrypted_set: HashSet<&Jid> = skdm_encrypted_devices.iter().collect();
+        let mut user_set = HashSet::new();
+        if let Some(ref dist) = distribution_list {
+            for d in dist {
+                if !encrypted_set.contains(d) {
+                    user_set.insert(d.user.clone());
+                }
+            }
+        }
+        user_set.into_iter().collect()
+    } else {
+        Vec::new()
+    };
+
     Ok(PreparedGroupStanza {
         node: stanza,
         skdm_devices: skdm_encrypted_devices,
+        stale_device_users: stale_users,
     })
 }
 
@@ -2390,6 +2492,50 @@ mod tests {
                 ..Default::default()
             };
             assert!(should_hide_decrypt_fail(&msg));
+        }
+    }
+
+    #[cfg(test)]
+    mod device_unregistered_tests {
+        use super::is_device_unregistered_error;
+        use crate::request::ServerErrorCode;
+
+        #[test]
+        fn detects_406_server_error_code() {
+            let err = anyhow::Error::new(ServerErrorCode {
+                code: 406,
+                text: "not-acceptable".to_string(),
+            });
+            assert!(is_device_unregistered_error(&err));
+        }
+
+        #[test]
+        fn rejects_non_406_server_error() {
+            let err = anyhow::Error::new(ServerErrorCode {
+                code: 404,
+                text: "not-found".to_string(),
+            });
+            assert!(!is_device_unregistered_error(&err));
+        }
+
+        #[test]
+        fn rejects_unrelated_error() {
+            let err = anyhow::anyhow!("some random error");
+            assert!(!is_device_unregistered_error(&err));
+        }
+
+        #[test]
+        fn rejects_wacore_iq_error_without_server_error_code_wrapper() {
+            // wacore::IqError::ServerError is NOT the same as ServerErrorCode.
+            // This simulates the old bug: if someone wraps wacore IqError directly
+            // without the ServerErrorCode wrapper, the check should not match.
+            let err = anyhow::Error::new(crate::request::IqError::ServerError {
+                code: 406,
+                text: "not-acceptable".to_string(),
+            });
+            // This would only match if we also checked IqError (we don't — we use ServerErrorCode)
+            // The SendContextResolver impl is responsible for wrapping in ServerErrorCode
+            assert!(!is_device_unregistered_error(&err));
         }
     }
 }

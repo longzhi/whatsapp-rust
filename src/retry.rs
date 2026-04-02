@@ -48,11 +48,6 @@ fn extract_registration_id_from_node(node: &Node) -> Option<u32> {
 /// We refuse to resend if the requester has already retried this many times.
 const MAX_RETRY_COUNT: u8 = 5;
 
-/// Minimum retry count before we include keys in retry receipts.
-/// WhatsApp Web only includes keys when retryCount >= 2, giving the first
-/// retry a chance to succeed without key exchange overhead.
-const MIN_RETRY_COUNT_FOR_KEYS: u8 = 2;
-
 /// Minimum retry count before we start tracking base keys.
 /// WhatsApp Web saves base key on retry 2, checks on retry > 2.
 const MIN_RETRY_FOR_BASE_KEY_CHECK: u8 = 2;
@@ -175,8 +170,9 @@ impl Client {
             .parse::<wacore_binary::jid::Jid>()
             .unwrap_or_else(|_| receipt.source.sender.clone());
 
-        // Device existence check (matches WhatsApp Web's WAWebApiDeviceList.hasDevice).
-        // This prevents processing retry receipts from unknown/stale devices.
+        // Resolved JID for session operations; keep original for stanza addressing
+        let resolved_jid = self.resolve_encryption_jid(&participant_jid).await;
+
         let sender_device_id = participant_jid.device() as u32;
         let sender_user = participant_jid.user.clone();
         if !self.has_device(&sender_user, sender_device_id).await {
@@ -192,7 +188,11 @@ impl Client {
         let is_peer = device_snapshot
             .pn
             .as_ref()
-            .is_some_and(|our_pn| participant_jid.user == our_pn.user);
+            .is_some_and(|our_pn| participant_jid.is_same_user_as(our_pn))
+            || device_snapshot
+                .lid
+                .as_ref()
+                .is_some_and(|our_lid| participant_jid.is_same_user_as(our_lid));
 
         // Process key bundle to establish a pairwise session for the retry.
         // Needed for both DMs and groups (group retries use pairwise, not sender key).
@@ -200,7 +200,7 @@ impl Client {
         if !receipt.source.chat.is_status_broadcast() {
             // Try to process key bundle if present
             let key_bundle_result = self
-                .process_retry_key_bundle(node, &participant_jid, is_peer)
+                .process_retry_key_bundle(node, &resolved_jid, is_peer)
                 .await;
 
             if let Err(e) = &key_bundle_result {
@@ -213,7 +213,7 @@ impl Client {
                 // session, delete the session to force re-establishment.
                 // This handles the case where the requester reinstalled but didn't include keys.
                 if let Some(received_reg_id) = extract_registration_id_from_node(node) {
-                    let signal_address = participant_jid.to_protocol_address();
+                    let signal_address = resolved_jid.to_protocol_address();
                     let device_store = self.persistence_manager.get_device_arc().await;
                     let device_guard = device_store.read().await;
 
@@ -237,9 +237,9 @@ impl Client {
                             signal_address, stored_reg_id, received_reg_id
                         );
                         self.signal_cache.delete_session(&signal_address).await;
-                        self.flush_signal_cache().await.unwrap_or_else(|e| {
+                        if let Err(e) = self.flush_signal_cache().await {
                             log::warn!("Failed to flush session deletion for reg ID mismatch: {e}");
-                        });
+                        }
                     }
                 }
             }
@@ -362,7 +362,7 @@ impl Client {
             // For DMs, handle base key tracking for collision detection (matches WhatsApp Web).
             // This detects when we haven't regenerated our session despite receiving retry receipts,
             // which can cause infinite retry loops where both sides are stuck with stale keys.
-            let signal_address = participant_jid.to_protocol_address();
+            let signal_address = resolved_jid.to_protocol_address();
             let device_store = self.persistence_manager.get_device_arc().await;
 
             // Check for base key collision before deleting the session.
@@ -437,9 +437,7 @@ impl Client {
             // Delete the old session through the signal cache so encryption uses a fresh session.
             // IMPORTANT: Must go through cache, not backend, to avoid stale cached sessions.
             self.signal_cache.delete_session(&signal_address).await;
-            self.flush_signal_cache().await.unwrap_or_else(|e| {
-                log::warn!("Failed to flush signal cache after session delete: {e}");
-            });
+            self.flush_signal_cache().await?;
             info!("Deleted session for {signal_address} due to retry receipt");
         }
 
@@ -462,7 +460,6 @@ impl Client {
         if receipt.source.chat.is_group() {
             // Group retry: pairwise encrypt to failing device only (RetryMsgJob.js:71).
             // Using sender-key broadcast would resend to ALL participants → duplicates.
-            let encryption_jid = self.resolve_encryption_jid(&participant_jid).await;
             let device_snapshot = self.persistence_manager.get_device_snapshot().await;
 
             let addressing_mode = cached_group_info
@@ -470,18 +467,14 @@ impl Client {
                 .map(|g| g.addressing_mode)
                 .unwrap_or_default();
 
-            let device_store_arc = self.persistence_manager.get_device_arc().await;
-            let mut store_adapter = crate::store::signal_adapter::SignalProtocolStoreAdapter::new(
-                device_store_arc,
-                self.signal_cache.clone(),
-            );
+            let mut store_adapter = self.signal_adapter().await;
 
             let stanza = wacore::send::prepare_group_retry_stanza(
                 &mut store_adapter.session_store,
                 &mut store_adapter.identity_store,
                 receipt.source.chat.clone(),
                 participant_jid,
-                encryption_jid,
+                resolved_jid.clone(),
                 &original_msg,
                 message_id,
                 retry_count,
@@ -491,9 +484,7 @@ impl Client {
             .await?;
 
             self.send_node(stanza).await?;
-            self.flush_signal_cache().await.unwrap_or_else(|e| {
-                log::warn!("Failed to flush signal cache after group retry: {e}");
-            });
+            self.flush_signal_cache().await?;
         } else {
             // DM retry: re-encrypt via normal send path (already targets single recipient)
             self.send_message_impl(
@@ -552,7 +543,8 @@ impl Client {
             return Err(anyhow::anyhow!("Invalid registration ID in retry receipt"));
         }
 
-        let signal_address = requester_jid.to_protocol_address();
+        let resolved_jid = self.resolve_encryption_jid(requester_jid).await;
+        let signal_address = resolved_jid.to_protocol_address();
 
         // Check if the registration ID changed (indicates device reinstall).
         // Read session through cache for consistent state.
@@ -634,20 +626,10 @@ impl Client {
 
         // Acquire per-sender session lock to prevent race with concurrent message decryption.
         // This matches the session_locks pattern used in process_session_enc_batch.
-        let session_mutex = self
-            .session_locks
-            .get_with_by_ref(signal_address.as_str(), async {
-                std::sync::Arc::new(async_lock::Mutex::new(()))
-            })
-            .await;
+        let session_mutex = self.session_lock_for(signal_address.as_str()).await;
         let _session_guard = session_mutex.lock().await;
 
-        let device_store = self.persistence_manager.get_device_arc().await;
-
-        let mut adapter = crate::store::signal_adapter::SignalProtocolStoreAdapter::new(
-            device_store,
-            self.signal_cache.clone(),
-        );
+        let mut adapter = self.signal_adapter().await;
 
         process_prekey_bundle(
             &signal_address,
@@ -730,14 +712,7 @@ impl Client {
             .bytes(registration_id_bytes)
             .build();
 
-        // WhatsApp Web only includes keys when retryCount >= 2.
-        // First retry gives the sender a chance to resend without full key exchange.
-        //
-        // WA Web includes keys at retryCount >= MIN_RETRY_COUNT_FOR_KEYS.
-        // Optimization for NoSession: include keys on retry#1 to reduce round-trips
-        // for skmsg-only failures where the sender needs our prekeys for SKDM.
-        let include_keys_early = reason == RetryReason::NoSession;
-        let keys_node = if retry_count >= MIN_RETRY_COUNT_FOR_KEYS || include_keys_early {
+        let keys_node = if wacore::protocol::retry::should_include_keys(retry_count, reason) {
             let device_store = self.persistence_manager.get_device_arc().await;
             let device_guard = device_store.read().await;
 
@@ -1603,8 +1578,8 @@ mod tests {
 
         for (retry_count, reason, should_include_keys, description) in test_cases {
             // Replicate the logic from send_retry_receipt
-            let include_keys_early = reason == RetryReason::NoSession;
-            let would_include_keys = retry_count >= MIN_RETRY_COUNT_FOR_KEYS || include_keys_early;
+            let would_include_keys =
+                wacore::protocol::retry::should_include_keys(retry_count, reason);
 
             assert_eq!(
                 would_include_keys, should_include_keys,
@@ -1655,10 +1630,8 @@ mod tests {
                     RetryReason::NoSession
                 };
 
-                // Apply the optimization logic
-                let include_keys_early = reason == RetryReason::NoSession;
                 let would_include_keys =
-                    retry_count >= MIN_RETRY_COUNT_FOR_KEYS || include_keys_early;
+                    wacore::protocol::retry::should_include_keys(retry_count, reason);
 
                 if would_include_keys {
                     keys_included.fetch_add(1, Ordering::SeqCst);
@@ -1714,8 +1687,7 @@ mod tests {
         let reason = RetryReason::NoSession;
 
         // With optimization, we include keys on retry#1
-        let include_keys_early = reason == RetryReason::NoSession;
-        let would_include_keys = retry_count >= MIN_RETRY_COUNT_FOR_KEYS || include_keys_early;
+        let would_include_keys = wacore::protocol::retry::should_include_keys(retry_count, reason);
 
         assert!(
             would_include_keys,

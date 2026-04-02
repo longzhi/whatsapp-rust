@@ -1,5 +1,4 @@
 use crate::client::Client;
-use crate::store::signal_adapter::SignalProtocolStoreAdapter;
 use crate::types::events::Event;
 use crate::types::message::MessageInfo;
 use log::{debug, warn};
@@ -156,17 +155,20 @@ impl Client {
         }
     }
 
-    /// Helper to generate consistent cache keys for retry logic.
-    /// Key format: "{chat}:{msg_id}:{sender}"
+    /// Generate consistent cache key for retry logic.
     pub(crate) async fn make_retry_cache_key(
         &self,
         chat: &Jid,
         msg_id: &str,
         sender: &Jid,
     ) -> String {
+        use std::fmt::Write;
         let chat = self.resolve_encryption_jid(chat).await;
         let sender = self.resolve_encryption_jid(sender).await;
-        format!("{}:{}:{}", chat, msg_id, sender)
+        let mut key =
+            String::with_capacity(chat.user.len() + msg_id.len() + sender.user.len() + 20);
+        let _ = write!(key, "{chat}:{msg_id}:{sender}");
+        key
     }
 
     /// Spawns a task that sends a retry receipt for a failed decryption.
@@ -270,85 +272,10 @@ impl Client {
             return;
         }
 
-        // Determine the JID to use for end-to-end decryption.
-        // ... (previous JID resolution comments)
-        let sender_encryption_jid = {
-            let sender = &info.source.sender;
-            let alt = info.source.sender_alt.as_ref();
-            let pn_server = wacore_binary::jid::DEFAULT_USER_SERVER;
-            let lid_server = wacore_binary::jid::HIDDEN_USER_SERVER;
-
-            if sender.server == lid_server {
-                // Sender is already LID - use it directly for session lookup.
-                // Also cache the LID-to-PN mapping if PN alt is available.
-                if let Some(alt_jid) = alt
-                    && alt_jid.server == pn_server
-                {
-                    if let Err(err) = self
-                        .add_lid_pn_mapping(
-                            &sender.user,
-                            &alt_jid.user,
-                            crate::lid_pn_cache::LearningSource::PeerLidMessage,
-                        )
-                        .await
-                    {
-                        warn!(
-                            "Failed to persist LID-to-PN mapping {} -> {}: {err}",
-                            sender.user, alt_jid.user
-                        );
-                    }
-                    debug!(
-                        "Cached LID-to-PN mapping: {} -> {}",
-                        sender.user, alt_jid.user
-                    );
-                }
-                sender.clone()
-            } else if sender.server == pn_server {
-                // ... (PN to LID resolution logic)
-                if let Some(alt_jid) = alt
-                    && alt_jid.server == lid_server
-                {
-                    if let Err(err) = self
-                        .add_lid_pn_mapping(
-                            &alt_jid.user,
-                            &sender.user,
-                            crate::lid_pn_cache::LearningSource::PeerPnMessage,
-                        )
-                        .await
-                    {
-                        warn!(
-                            "Failed to persist PN-to-LID mapping {} -> {}: {err}",
-                            sender.user, alt_jid.user
-                        );
-                    }
-                    debug!(
-                        "Cached PN-to-LID mapping: {} -> {}",
-                        sender.user, alt_jid.user
-                    );
-
-                    Jid {
-                        user: alt_jid.user.clone(),
-                        server: wacore_binary::jid::cow_server_from_str(lid_server),
-                        device: sender.device,
-                        agent: sender.agent,
-                        integrator: sender.integrator,
-                    }
-                } else if let Some(lid_user) = self.lid_pn_cache.get_current_lid(&sender.user).await
-                {
-                    Jid {
-                        user: lid_user.clone(),
-                        server: wacore_binary::jid::cow_server_from_str(lid_server),
-                        device: sender.device,
-                        agent: sender.agent,
-                        integrator: sender.integrator,
-                    }
-                } else {
-                    sender.clone()
-                }
-            } else {
-                sender.clone()
-            }
-        };
+        // Warm LID-PN cache before resolution so resolve_encryption_jid() finds the mapping
+        self.cache_lid_pn_from_message(&info.source.sender, info.source.sender_alt.as_ref())
+            .await;
+        let sender_encryption_jid = self.resolve_encryption_jid(&info.source.sender).await;
 
         let has_unavailable = node.get_optional_child("unavailable").is_some();
 
@@ -683,18 +610,10 @@ impl Client {
         // the SignalProtocolStoreAdapter's per-session locks (prevents ratchet counter races).
         let signal_address = sender_encryption_jid.to_protocol_address();
 
-        let session_mutex = self
-            .session_locks
-            .get_with_by_ref(signal_address.as_str(), async {
-                std::sync::Arc::new(async_lock::Mutex::new(()))
-            })
-            .await;
+        let session_mutex = self.session_lock_for(signal_address.as_str()).await;
         let _session_guard = session_mutex.lock().await;
 
-        let mut adapter = SignalProtocolStoreAdapter::new(
-            self.persistence_manager.get_device_arc().await,
-            self.signal_cache.clone(),
-        );
+        let mut adapter = self.signal_adapter().await;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let mut any_success = false;
         let mut any_duplicate = false;
@@ -937,15 +856,45 @@ impl Client {
                                 }
                             }
                         }
+
+                        // Re-issue tctoken so the contact still has a valid token for us
+                        let sender_jid = info.source.sender.clone();
+                        if !sender_jid.is_bot() && !sender_jid.is_status_broadcast() {
+                            let client = self.clone();
+                            self.runtime
+                                .spawn(Box::pin(async move {
+                                    client
+                                        .reissue_tc_token_after_identity_change(&sender_jid)
+                                        .await;
+                                }))
+                                .detach();
+                        }
+
                         continue;
                     }
-                    // Handle SessionNotFound gracefully - send retry receipt to request session establishment
+                    // Try PN→LID session migration before sending retry receipt
                     if let SignalProtocolError::SessionNotFound(_) = e {
+                        if self
+                            .try_pn_to_lid_migration_decrypt(
+                                sender_encryption_jid,
+                                &signal_address,
+                                &parsed_message,
+                                &mut adapter,
+                                &mut rng,
+                                &enc_type,
+                                padding_version,
+                                info,
+                            )
+                            .await
+                        {
+                            any_success = true;
+                            continue;
+                        }
+
                         warn!(
                             "[msg:{}] No session found for {} message from {}. Sending retry receipt to request session establishment.",
                             info.id, enc_type, info.source.sender
                         );
-                        // Send retry receipt so the sender resends with a PreKeySignalMessage
                         dispatched_undecryptable = self.handle_decrypt_failure(
                             info,
                             RetryReason::NoSession,
@@ -1042,10 +991,9 @@ impl Client {
         if enc_nodes.is_empty() {
             return Ok(());
         }
-        let device_arc = self.persistence_manager.get_device_arc().await;
         // Use the signal cache adapter for group decryption so sender keys are read/written
         // through the cache, keeping it consistent with SKDM processing.
-        let mut adapter = SignalProtocolStoreAdapter::new(device_arc, self.signal_cache.clone());
+        let mut adapter = self.signal_adapter().await;
 
         for enc_node in enc_nodes {
             let ciphertext: &[u8] = match &enc_node.content {
@@ -1077,6 +1025,17 @@ impl Client {
 
             match decrypt_result {
                 Ok(padded_plaintext) => {
+                    // WA Web: isFromKnownDevice() in preProcessMsg
+                    if !self.is_from_known_device(&info.source.sender).await {
+                        warn!(
+                            "[msg:{}] Unknown device {}, triggering device sync",
+                            info.id, info.source.sender
+                        );
+                        self.handle_unknown_device_sync(info).await;
+                        self.spawn_retry_receipt(info, RetryReason::UnknownCompanionNoPrekey);
+                        continue;
+                    }
+
                     if let Err(e) = self
                         .clone()
                         .handle_decrypted_plaintext(
@@ -1110,15 +1069,24 @@ impl Client {
                         continue;
                     }
 
-                    // No sender key for this group/sender — the SKDM was never received
-                    // (sender thinks we have it from a previous status/session).
-                    // Send retry receipt to ask sender to re-distribute SKDM.
+                    let is_unknown_device = !self.is_from_known_device(&info.source.sender).await;
+                    let retry_reason = if is_unknown_device {
+                        RetryReason::UnknownCompanionNoPrekey
+                    } else {
+                        RetryReason::NoSession
+                    };
+
                     warn!(
                         "No sender key state for group message [msg:{}] from {}: {}. Sending retry receipt.",
                         info.id, info.source.sender, msg
                     );
+
+                    if is_unknown_device {
+                        self.handle_unknown_device_sync(info).await;
+                    }
+
                     self.dispatch_undecryptable_event(info, decrypt_fail_mode);
-                    self.spawn_retry_receipt(info, RetryReason::NoSession);
+                    self.spawn_retry_receipt(info, retry_reason);
                 }
                 Err(e) => {
                     if info.is_expired_status() {
@@ -1142,6 +1110,31 @@ impl Client {
             }
         }
         Ok(())
+    }
+
+    /// WA Web: online → `syncDeviceListJob`, offline → `OfflinePendingDeviceCache`.
+    async fn handle_unknown_device_sync(self: &Arc<Self>, info: &MessageInfo) {
+        let user_jid = info.source.sender.to_non_ad();
+
+        // Dedup: skip if we already have a sync pending/in-flight for this user
+        if !self.pending_device_sync.add(user_jid.clone()).await {
+            return;
+        }
+
+        if info.is_offline {
+            log::debug!("Queueing {} for pending device sync (offline)", user_jid);
+        } else {
+            log::debug!("Triggering immediate device sync for {}", user_jid);
+            let client = Arc::clone(self);
+            self.runtime
+                .spawn(Box::pin(async move {
+                    client.invalidate_device_cache(&user_jid.user).await;
+                    if let Err(e) = client.get_user_devices(&[user_jid]).await {
+                        log::warn!("Immediate device sync failed: {e:?}");
+                    }
+                }))
+                .detach();
+        }
     }
 
     async fn handle_decrypted_plaintext(
@@ -1222,6 +1215,123 @@ impl Client {
             self.dispatch_parsed_message(msg, info);
         }
         Ok(())
+    }
+
+    /// Attempt PN→LID session migration and retry decryption.
+    /// Returns true if decryption succeeded after migration.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_pn_to_lid_migration_decrypt(
+        self: &Arc<Self>,
+        sender_jid: &Jid,
+        signal_address: &wacore::libsignal::protocol::ProtocolAddress,
+        parsed_message: &wacore::libsignal::protocol::CiphertextMessage,
+        adapter: &mut crate::store::signal_adapter::SignalProtocolStoreAdapter,
+        rng: &mut rand::rngs::StdRng,
+        enc_type: &str,
+        padding_version: u8,
+        info: &MessageInfo,
+    ) -> bool {
+        use wacore::libsignal::protocol::{UsePQRatchet, message_decrypt};
+
+        if !sender_jid.is_lid() {
+            return false;
+        }
+
+        let Some(pn) = self.lid_pn_cache.get_phone_number(&sender_jid.user).await else {
+            return false;
+        };
+
+        self.migrate_signal_sessions_on_lid_discovery(&pn, &sender_jid.user)
+            .await;
+
+        // Migration now goes through signal_cache, so no manual reload needed
+
+        match message_decrypt(
+            parsed_message,
+            signal_address,
+            &mut adapter.session_store,
+            &mut adapter.identity_store,
+            &mut adapter.pre_key_store,
+            &adapter.signed_pre_key_store,
+            rng,
+            UsePQRatchet::No,
+        )
+        .await
+        {
+            Ok(padded_plaintext) => {
+                log::info!(
+                    "[msg:{}] Decrypted after PN→LID session migration for {}",
+                    info.id,
+                    info.source.sender
+                );
+                if let Err(e) = self
+                    .clone()
+                    .handle_decrypted_plaintext(enc_type, &padded_plaintext, padding_version, info)
+                    .await
+                {
+                    log::warn!(
+                        "[msg:{}] Failed processing plaintext after migration: {e:?}",
+                        info.id
+                    );
+                }
+                true
+            }
+            Err(SignalProtocolError::DuplicatedMessage(chain, counter)) => {
+                log::debug!(
+                    "[msg:{}] Already processed (chain {chain}, counter {counter}) after migration",
+                    info.id
+                );
+                true
+            }
+            Err(retry_err) => {
+                log::warn!(
+                    "[msg:{}] Decryption still failed after PN→LID migration: {retry_err:?}",
+                    info.id
+                );
+                false
+            }
+        }
+    }
+
+    /// Cache LID-PN mapping from message attributes (before resolve_encryption_jid).
+    async fn cache_lid_pn_from_message(&self, sender: &Jid, alt: Option<&Jid>) {
+        let pn_server = wacore_binary::jid::DEFAULT_USER_SERVER;
+        let lid_server = wacore_binary::jid::HIDDEN_USER_SERVER;
+
+        let (lid_user, pn_user, source) = if sender.server == lid_server {
+            if let Some(alt_jid) = alt
+                && alt_jid.server == pn_server
+            {
+                (
+                    &sender.user,
+                    &alt_jid.user,
+                    crate::lid_pn_cache::LearningSource::PeerLidMessage,
+                )
+            } else {
+                return;
+            }
+        } else if sender.server == pn_server {
+            if let Some(alt_jid) = alt
+                && alt_jid.server == lid_server
+            {
+                (
+                    &alt_jid.user,
+                    &sender.user,
+                    crate::lid_pn_cache::LearningSource::PeerPnMessage,
+                )
+            } else {
+                return;
+            }
+        } else {
+            return;
+        };
+
+        if let Err(err) = self.add_lid_pn_mapping(lid_user, pn_user, source).await {
+            warn!(
+                "Failed to cache LID-PN mapping {} <-> {}: {err}",
+                lid_user, pn_user
+            );
+        }
     }
 
     pub(crate) async fn parse_message_info(
@@ -1387,15 +1497,13 @@ impl Client {
             },
         };
 
-        let device_arc = self.persistence_manager.get_device_arc().await;
-
         let sender_address = sender_jid.to_protocol_address();
 
         let sender_key_name = SenderKeyName::new(group_jid.to_string(), sender_address.to_string());
 
         // Route through the signal cache adapter so the sender key is immediately visible
         // in the cache for subsequent group_decrypt calls within the same message batch.
-        let mut adapter = SignalProtocolStoreAdapter::new(device_arc, self.signal_cache.clone());
+        let mut adapter = self.signal_adapter().await;
 
         if let Err(e) = process_sender_key_distribution_message(
             &sender_key_name,
@@ -2870,10 +2978,15 @@ mod tests {
             "Should detect self-sent DM from own LID"
         );
 
-        // 2. sender_alt should be None (peer_recipient_pn is recipient's PN, not sender's)
+        // 2. sender_alt should be own PN (derived from own_jid, not message attrs)
         assert!(
-            info.source.sender_alt.is_none(),
-            "sender_alt should be None for self-sent DMs (peer_recipient_pn is recipient's PN)"
+            info.source.sender_alt.is_some(),
+            "sender_alt should be own PN for self-sent LID messages"
+        );
+        assert_eq!(
+            info.source.sender_alt.as_ref().unwrap().user,
+            "15551234567",
+            "sender_alt should be the own PN user"
         );
 
         assert_eq!(
@@ -3057,8 +3170,13 @@ mod tests {
         );
 
         assert!(
-            info.source.sender_alt.is_none(),
-            "sender_alt should be None for self-sent messages"
+            info.source.sender_alt.is_some(),
+            "sender_alt should be own PN for self-sent LID messages"
+        );
+        assert_eq!(
+            info.source.sender_alt.as_ref().unwrap().user,
+            "15551234567",
+            "sender_alt should match own PN"
         );
 
         assert_eq!(
@@ -3747,12 +3865,14 @@ mod tests {
             verified_name: None,
             device_sent_meta: None,
             ephemeral_expiration: None,
+            is_offline: false,
         }
     }
 
     /// Helper to create a test client for retry tests with a unique database
     async fn create_test_client_for_retry_with_id(test_id: &str) -> Arc<Client> {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
         static COUNTER: AtomicU64 = AtomicU64::new(0);
 
         let unique_id = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -4772,7 +4892,7 @@ mod tests {
     /// on generation mismatch. Used by the bug-demonstration test.
     async fn acquire_permit_old_behavior(
         semaphore: &std::sync::Mutex<Arc<async_lock::Semaphore>>,
-        generation: &std::sync::atomic::AtomicU64,
+        generation: &portable_atomic::AtomicU64,
     ) -> bool {
         use std::sync::atomic::Ordering;
         let (snap_gen, snap_sem) = {
@@ -4789,7 +4909,7 @@ mod tests {
     /// handle_incoming_message.
     async fn acquire_permit_with_reacquire(
         semaphore: &std::sync::Mutex<Arc<async_lock::Semaphore>>,
-        generation: &std::sync::atomic::AtomicU64,
+        generation: &portable_atomic::AtomicU64,
     ) {
         use std::sync::atomic::Ordering;
         loop {
@@ -4809,8 +4929,9 @@ mod tests {
     /// Demonstrates the bug: the OLD code silently dropped tasks when generation changed.
     #[tokio::test]
     async fn test_old_behavior_drops_tasks_on_generation_swap() {
+        use portable_atomic::AtomicU64;
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let semaphore = Arc::new(std::sync::Mutex::new(Arc::new(async_lock::Semaphore::new(
             1,
@@ -4871,8 +4992,9 @@ mod tests {
     /// Verifies the fix: re-acquire loop ensures NO tasks are dropped on generation swap.
     #[tokio::test]
     async fn test_semaphore_generation_swap_does_not_drop_tasks() {
+        use portable_atomic::AtomicU64;
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let semaphore = Arc::new(std::sync::Mutex::new(Arc::new(async_lock::Semaphore::new(
             1,

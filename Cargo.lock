@@ -621,6 +621,7 @@ name = "e2e-tests"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "chrono",
  "dhat",
  "env_logger",
@@ -2395,6 +2396,7 @@ dependencies = [
  "md5",
  "once_cell",
  "pbkdf2",
+ "portable-atomic",
  "prost",
  "rand",
  "serde",
@@ -2643,6 +2645,7 @@ dependencies = [
  "hex",
  "log",
  "moka",
+ "portable-atomic",
  "prost",
  "rand",
  "scopeguard",
@@ -2669,6 +2672,7 @@ dependencies = [
  "diesel_migrations",
  "libsqlite3-sys",
  "log",
+ "portable-atomic",
  "serde_json",
  "tokio",
  "wacore",

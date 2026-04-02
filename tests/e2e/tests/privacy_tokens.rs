@@ -3,7 +3,6 @@ use e2e_tests::{
 };
 use log::info;
 use std::sync::Arc;
-use wacore::iq::tctoken::tc_token_expiration_cutoff;
 use wacore::store::traits::TcTokenEntry;
 use wacore::types::events::Event;
 use wacore_binary::node::Node;
@@ -180,7 +179,16 @@ async fn test_reply_to_restricted_contact_uses_received_tc_token() -> anyhow::Re
         .await?;
     client_a.wait_for_text(reply, 30).await?;
 
-    let updated_entry = client_b.wait_for_tc_token(&key_a, 5).await?;
+    // sender_timestamp is set by fire-and-forget issuance after send — poll for it
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    let mut updated_entry = client_b.wait_for_tc_token(&key_a, 5).await?;
+    while updated_entry.sender_timestamp.is_none() {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        updated_entry = client_b.wait_for_tc_token(&key_a, 1).await?;
+    }
     assert!(
         updated_entry.sender_timestamp.is_some(),
         "using a valid tc token should set sender_timestamp"
@@ -196,7 +204,8 @@ async fn test_reply_to_restricted_contact_uses_received_tc_token() -> anyhow::Re
 async fn test_first_message_to_restricted_contact_receives_463_nack() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let restricted_name = restricted_push_name("e2e_tctok_463_a");
+    // cs_enabled=0: reject cstoken so first-contact triggers 463 even with NCT salt
+    let restricted_name = scenario_push_name("e2e_tctok_463_a", &["restricted", "cs_enabled=0"]);
     let mut client_a = TestClient::connect_as("e2e_tctok_463_a", &restricted_name).await?;
     let client_b = TestClient::connect("e2e_tctok_463_b").await?;
 
@@ -312,7 +321,10 @@ async fn test_prune_expired_tc_tokens_removes_only_stale_entries() -> anyhow::Re
 
     let client = TestClient::connect("e2e_tctok_prune").await?;
     let backend = client.client.persistence_manager().backend();
-    let cutoff = tc_token_expiration_cutoff();
+    // Use timestamps that are unambiguously expired/fresh under any AB prop config:
+    // - expired: timestamp 1 (1970) — expired under any bucket window
+    // - fresh: current time — valid under any config
+    let now = wacore::time::now_secs();
     let expired_key = format!("expired_{}", uuid::Uuid::new_v4());
     let fresh_key = format!("fresh_{}", uuid::Uuid::new_v4());
 
@@ -321,7 +333,7 @@ async fn test_prune_expired_tc_tokens_removes_only_stale_entries() -> anyhow::Re
             &expired_key,
             &TcTokenEntry {
                 token: vec![0x01],
-                token_timestamp: cutoff - 1,
+                token_timestamp: 1,
                 sender_timestamp: None,
             },
         )
@@ -331,8 +343,8 @@ async fn test_prune_expired_tc_tokens_removes_only_stale_entries() -> anyhow::Re
             &fresh_key,
             &TcTokenEntry {
                 token: vec![0x02],
-                token_timestamp: cutoff,
-                sender_timestamp: Some(cutoff),
+                token_timestamp: now,
+                sender_timestamp: Some(now),
             },
         )
         .await?;
@@ -527,10 +539,8 @@ async fn test_history_sync_nct_salt_enables_cstoken_first_contact() -> anyhow::R
         .wait_for_text("history-sync cstoken first contact", 30)
         .await?;
 
-    assert!(
-        client_b.client.tc_token().get(&key_a).await?.is_none(),
-        "cstoken fallback should not materialize a tc token entry for the recipient"
-    );
+    // Fire-and-forget issuance may store a tc_token from the IQ response —
+    // this is expected (WA Web's sendTcToken runs independently of cstoken usage)
 
     client_a.disconnect().await;
     client_b.disconnect().await;
@@ -657,10 +667,8 @@ async fn test_syncd_nct_salt_enables_cstoken_first_contact() -> anyhow::Result<(
         .wait_for_text("syncd cstoken first contact", 30)
         .await?;
 
-    assert!(
-        client_b.client.tc_token().get(&key_a).await?.is_none(),
-        "cstoken fallback should not materialize a tc token entry for the recipient"
-    );
+    // Fire-and-forget issuance may store a tc_token from the IQ response —
+    // this is expected (WA Web's sendTcToken runs independently of cstoken usage)
 
     client_a.disconnect().await;
     client_b.disconnect().await;

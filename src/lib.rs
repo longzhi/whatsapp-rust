@@ -12,6 +12,7 @@ pub mod portable_cache;
 pub mod cache_config;
 pub use cache_config::{CacheConfig, CacheEntryConfig, CacheStores};
 pub mod cache_store;
+pub(crate) mod pending_device_sync;
 pub(crate) mod sender_key_device_cache;
 pub use cache_store::CacheStore;
 pub mod http;
@@ -67,8 +68,8 @@ pub use features::{
     MembershipRequest, Mex, MexError, MexErrorExtensions, MexRequest, MexResponse, Newsletter,
     NewsletterMessage, NewsletterMessageType, NewsletterMetadata, NewsletterReactionCount,
     NewsletterRole, NewsletterState, NewsletterVerification, ParticipantChangeResponse, Presence,
-    PresenceError, PresenceStatus, Profile, ProfilePicture, SetProfilePictureResponse, Status,
-    StatusPrivacySetting, StatusSendOptions, SyncActionMessageRange, TcToken,
+    PresenceError, PresenceStatus, Profile, ProfilePicture, SetProfilePictureResponse, Signal,
+    Status, StatusPrivacySetting, StatusSendOptions, SyncActionMessageRange, TcToken,
     UnlinkSubgroupsResult, UserInfo, group_type, message_key, message_range,
 };
 

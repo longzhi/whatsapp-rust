@@ -83,9 +83,11 @@ impl Client {
             .await
             .map_err(|e| anyhow!("persisting LID-PN mapping: {e}"))?;
 
-        // If this is a new LID mapping, migrate any existing PN-keyed device registry entries
+        // If this is a new LID mapping, migrate any existing PN-keyed entries to LID
         if is_new_mapping {
             self.migrate_device_registry_on_lid_discovery(phone_number, lid)
+                .await;
+            self.migrate_signal_sessions_on_lid_discovery(phone_number, lid)
                 .await;
         }
 
@@ -163,6 +165,76 @@ impl Client {
         } else {
             // Other server type - use as-is
             target.clone()
+        }
+    }
+
+    /// Migrate Signal sessions and identity keys from PN to LID address.
+    ///
+    /// All reads/writes go through `signal_cache` to avoid reading stale data
+    /// from the backend when the cache has unflushed mutations (e.g., after
+    /// SKDM encryption ratcheted the session).
+    pub(crate) async fn migrate_signal_sessions_on_lid_discovery(&self, pn: &str, lid: &str) {
+        use log::{info, warn};
+        use wacore::types::jid::JidExt;
+
+        let backend = self.persistence_manager.backend();
+
+        for device_id in 0..=99u16 {
+            let pn_jid = Jid::pn_device(pn.to_string(), device_id);
+            let lid_jid = Jid::lid_device(lid.to_string(), device_id);
+
+            let pn_proto = pn_jid.to_protocol_address();
+            let lid_proto = lid_jid.to_protocol_address();
+
+            // Migrate session: read from cache (authoritative), write to cache
+            if let Ok(Some(session)) = self
+                .signal_cache
+                .get_session(&pn_proto, backend.as_ref())
+                .await
+            {
+                if self
+                    .signal_cache
+                    .get_session(&lid_proto, backend.as_ref())
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    self.signal_cache.delete_session(&pn_proto).await;
+                    info!("Deleted stale PN session {} (LID exists)", pn_proto);
+                } else {
+                    self.signal_cache.put_session(&lid_proto, session).await;
+                    self.signal_cache.delete_session(&pn_proto).await;
+                    info!("Migrated session {} -> {}", pn_proto, lid_proto);
+                }
+            }
+
+            // Migrate identity: same cache-first pattern
+            if let Ok(Some(identity_data)) = self
+                .signal_cache
+                .get_identity(&pn_proto, backend.as_ref())
+                .await
+            {
+                if self
+                    .signal_cache
+                    .get_identity(&lid_proto, backend.as_ref())
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_none()
+                {
+                    self.signal_cache
+                        .put_identity(&lid_proto, &identity_data)
+                        .await;
+                    info!("Migrated identity {} -> {}", pn_proto, lid_proto);
+                }
+                self.signal_cache.delete_identity(&pn_proto).await;
+            }
+        }
+
+        // Flush migrated state to backend so it survives restarts
+        if let Err(e) = self.signal_cache.flush(backend.as_ref()).await {
+            warn!("Failed to flush signal cache after migration: {e:?}");
         }
     }
 
