@@ -8,3 +8,5 @@
 .env
 docs
 .claude
+__pycache__
+.codex

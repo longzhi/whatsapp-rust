@@ -5,15 +5,38 @@ use whatsapp_rust::download::{Downloadable, MediaType};
 use whatsapp_rust::upload::UploadResponse;
 use whatsapp_rust::waproto::whatsapp as wa;
 
+struct UploadedMediaParts {
+    url: String,
+    direct_path: String,
+    media_key: Vec<u8>,
+    file_sha256: Vec<u8>,
+    file_enc_sha256: Vec<u8>,
+    file_length: u64,
+}
+
+impl From<&UploadResponse> for UploadedMediaParts {
+    fn from(upload: &UploadResponse) -> Self {
+        Self {
+            url: upload.url.clone(),
+            direct_path: upload.direct_path.clone(),
+            media_key: upload.media_key.to_vec(),
+            file_sha256: upload.file_sha256.to_vec(),
+            file_enc_sha256: upload.file_enc_sha256.to_vec(),
+            file_length: upload.file_length,
+        }
+    }
+}
+
 /// Helper: build an ImageMessage from an UploadResponse.
 fn build_image_message(upload: &UploadResponse, caption: Option<&str>) -> wa::Message {
+    let upload = UploadedMediaParts::from(upload);
     wa::Message {
         image_message: Some(Box::new(wa::message::ImageMessage {
-            url: Some(upload.url.clone()),
-            direct_path: Some(upload.direct_path.clone()),
-            media_key: Some(upload.media_key.to_vec()),
-            file_sha256: Some(upload.file_sha256.to_vec()),
-            file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+            url: Some(upload.url),
+            direct_path: Some(upload.direct_path),
+            media_key: Some(upload.media_key),
+            file_sha256: Some(upload.file_sha256),
+            file_enc_sha256: Some(upload.file_enc_sha256),
             file_length: Some(upload.file_length),
             mimetype: Some("image/jpeg".to_string()),
             caption: caption.map(|c| c.to_string()),
@@ -29,13 +52,14 @@ fn build_video_message(
     caption: Option<&str>,
     seconds: u32,
 ) -> wa::Message {
+    let upload = UploadedMediaParts::from(upload);
     wa::Message {
         video_message: Some(Box::new(wa::message::VideoMessage {
-            url: Some(upload.url.clone()),
-            direct_path: Some(upload.direct_path.clone()),
-            media_key: Some(upload.media_key.to_vec()),
-            file_sha256: Some(upload.file_sha256.to_vec()),
-            file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+            url: Some(upload.url),
+            direct_path: Some(upload.direct_path),
+            media_key: Some(upload.media_key),
+            file_sha256: Some(upload.file_sha256),
+            file_enc_sha256: Some(upload.file_enc_sha256),
             file_length: Some(upload.file_length),
             mimetype: Some("video/mp4".to_string()),
             seconds: Some(seconds),
@@ -48,13 +72,14 @@ fn build_video_message(
 
 /// Helper: build a DocumentMessage from an UploadResponse.
 fn build_document_message(upload: &UploadResponse, filename: &str, mimetype: &str) -> wa::Message {
+    let upload = UploadedMediaParts::from(upload);
     wa::Message {
         document_message: Some(Box::new(wa::message::DocumentMessage {
-            url: Some(upload.url.clone()),
-            direct_path: Some(upload.direct_path.clone()),
-            media_key: Some(upload.media_key.to_vec()),
-            file_sha256: Some(upload.file_sha256.to_vec()),
-            file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+            url: Some(upload.url),
+            direct_path: Some(upload.direct_path),
+            media_key: Some(upload.media_key),
+            file_sha256: Some(upload.file_sha256),
+            file_enc_sha256: Some(upload.file_enc_sha256),
             file_length: Some(upload.file_length),
             mimetype: Some(mimetype.to_string()),
             file_name: Some(filename.to_string()),
@@ -66,13 +91,14 @@ fn build_document_message(upload: &UploadResponse, filename: &str, mimetype: &st
 
 /// Helper: build an AudioMessage from an UploadResponse.
 fn build_audio_message(upload: &UploadResponse, ptt: bool, seconds: u32) -> wa::Message {
+    let upload = UploadedMediaParts::from(upload);
     wa::Message {
         audio_message: Some(Box::new(wa::message::AudioMessage {
-            url: Some(upload.url.clone()),
-            direct_path: Some(upload.direct_path.clone()),
-            media_key: Some(upload.media_key.to_vec()),
-            file_sha256: Some(upload.file_sha256.to_vec()),
-            file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+            url: Some(upload.url),
+            direct_path: Some(upload.direct_path),
+            media_key: Some(upload.media_key),
+            file_sha256: Some(upload.file_sha256),
+            file_enc_sha256: Some(upload.file_enc_sha256),
             file_length: Some(upload.file_length),
             mimetype: Some(if ptt {
                 "audio/ogg; codecs=opus".to_string()
@@ -392,7 +418,7 @@ async fn test_send_image_message() -> anyhow::Result<()> {
         )
         .await?;
 
-    if let Event::Message(msg, info) = event {
+    if let Event::Message(msg, info) = &*event {
         let img = msg.image_message.as_ref().unwrap();
         assert_eq!(img.caption.as_deref(), Some(caption));
         assert_eq!(img.mimetype.as_deref(), Some("image/jpeg"));
@@ -450,7 +476,7 @@ async fn test_send_video_message() -> anyhow::Result<()> {
         )
         .await?;
 
-    if let Event::Message(msg, _) = event {
+    if let Event::Message(msg, _) = &*event {
         let vid = msg.video_message.as_ref().unwrap();
         assert_eq!(vid.caption.as_deref(), Some("Cool video"));
         assert_eq!(vid.seconds, Some(15));
@@ -500,7 +526,7 @@ async fn test_send_document_message() -> anyhow::Result<()> {
         )
         .await?;
 
-    if let Event::Message(msg, _) = event {
+    if let Event::Message(msg, _) = &*event {
         let doc = msg.document_message.as_ref().unwrap();
         assert_eq!(doc.file_name.as_deref(), Some("report.pdf"));
         assert_eq!(doc.mimetype.as_deref(), Some("application/pdf"));
@@ -549,7 +575,7 @@ async fn test_send_audio_message() -> anyhow::Result<()> {
         )
         .await?;
 
-    if let Event::Message(msg, _) = event {
+    if let Event::Message(msg, _) = &*event {
         let audio = msg.audio_message.as_ref().unwrap();
         assert_eq!(audio.seconds, Some(30));
         assert_eq!(audio.ptt, Some(false));
@@ -598,7 +624,7 @@ async fn test_send_ptt_voice_message() -> anyhow::Result<()> {
         )
         .await?;
 
-    if let Event::Message(msg, _) = event {
+    if let Event::Message(msg, _) = &*event {
         let audio = msg.audio_message.as_ref().unwrap();
         assert_eq!(audio.ptt, Some(true));
         assert_eq!(audio.seconds, Some(5));
@@ -656,7 +682,7 @@ async fn test_send_image_bidirectional() -> anyhow::Result<()> {
             |e| matches!(e, Event::Message(m, _) if m.image_message.is_some()),
         )
         .await?;
-    if let Event::Message(msg, _) = event {
+    if let Event::Message(msg, _) = &*event {
         let img = msg.image_message.as_ref().unwrap();
         assert_eq!(img.caption.as_deref(), Some("From A"));
         let downloaded = client_b
@@ -682,7 +708,7 @@ async fn test_send_image_bidirectional() -> anyhow::Result<()> {
             |e| matches!(e, Event::Message(m, _) if m.image_message.is_some()),
         )
         .await?;
-    if let Event::Message(msg, _) = event {
+    if let Event::Message(msg, _) = &*event {
         let img = msg.image_message.as_ref().unwrap();
         assert_eq!(img.caption.as_deref(), Some("From B"));
         let downloaded = client_a
@@ -728,7 +754,7 @@ async fn test_send_multiple_media_types() -> anyhow::Result<()> {
             |e| matches!(e, Event::Message(m, _) if m.image_message.is_some()),
         )
         .await?;
-    if let Event::Message(msg, _) = event {
+    if let Event::Message(msg, _) = &*event {
         let img = msg.image_message.as_ref().unwrap();
         let dl = client_b
             .client
@@ -752,7 +778,7 @@ async fn test_send_multiple_media_types() -> anyhow::Result<()> {
             |e| matches!(e, Event::Message(m, _) if m.document_message.is_some()),
         )
         .await?;
-    if let Event::Message(msg, _) = event {
+    if let Event::Message(msg, _) = &*event {
         let doc = msg.document_message.as_ref().unwrap();
         let dl = client_b
             .client
@@ -776,7 +802,7 @@ async fn test_send_multiple_media_types() -> anyhow::Result<()> {
             |e| matches!(e, Event::Message(m, _) if m.audio_message.is_some()),
         )
         .await?;
-    if let Event::Message(msg, _) = event {
+    if let Event::Message(msg, _) = &*event {
         let audio = msg.audio_message.as_ref().unwrap();
         let dl = client_b
             .client
@@ -893,7 +919,7 @@ async fn test_send_image_no_caption() -> anyhow::Result<()> {
         )
         .await?;
 
-    if let Event::Message(msg, _) = event {
+    if let Event::Message(msg, _) = &*event {
         let img = msg.image_message.as_ref().unwrap();
         assert!(
             img.caption.is_none() || img.caption.as_deref() == Some(""),

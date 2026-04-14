@@ -369,7 +369,7 @@ impl DownloadUtils {
             cipher: &Aes256,
             prev_block: &[u8; BLOCK],
         ) -> Result<([u8; BLOCK], [u8; BLOCK])> {
-            use aes::cipher::{Block, BlockDecrypt};
+            use aes::cipher::{Block, BlockCipherDecrypt};
             let cblock_arr: [u8; BLOCK] = cblock
                 .try_into()
                 .map_err(|_| anyhow!("Invalid block size"))?;
@@ -384,7 +384,7 @@ impl DownloadUtils {
 
         let (iv, cipher_key, mac_key) = Self::get_media_keys(media_key, app_info)?;
 
-        let mut hmac = <Hmac<Sha256> as hmac::Mac>::new_from_slice(&mac_key)
+        let mut hmac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&mac_key)
             .map_err(|_| anyhow!("Failed to init HMAC"))?;
         hmac.update(&iv);
 

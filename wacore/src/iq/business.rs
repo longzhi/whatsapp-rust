@@ -5,8 +5,8 @@ use crate::iq::node::optional_attr;
 use crate::iq::spec::IqSpec;
 use crate::request::InfoQuery;
 use wacore_binary::builder::NodeBuilder;
-use wacore_binary::jid::{Jid, SERVER_JID};
-use wacore_binary::node::{Node, NodeContent};
+use wacore_binary::{Jid, Server};
+use wacore_binary::{NodeContent, NodeContentRef, NodeRef};
 
 #[derive(Debug, Clone, PartialEq, Eq, StringEnum)]
 pub enum DayOfWeek {
@@ -52,10 +52,10 @@ impl serde::Serialize for BusinessHourMode {
     }
 }
 
-fn node_text(node: &Node) -> Option<String> {
-    match &node.content {
-        Some(NodeContent::String(s)) => Some(s.clone()),
-        Some(NodeContent::Bytes(b)) => String::from_utf8(b.clone()).ok(),
+fn node_text(node: &NodeRef<'_>) -> Option<String> {
+    match node.content.as_deref() {
+        Some(NodeContentRef::String(s)) => Some(s.to_string()),
+        Some(NodeContentRef::Bytes(b)) => std::str::from_utf8(b).ok().map(|s| s.to_string()),
         _ => None,
     }
 }
@@ -87,10 +87,8 @@ pub struct BusinessHours {
 pub struct BusinessHoursConfig {
     pub day_of_week: DayOfWeek,
     pub mode: BusinessHourMode,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub open_time: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub close_time: Option<String>,
+    pub open_time: u32,
+    pub close_time: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -116,19 +114,17 @@ impl IqSpec for BusinessProfileSpec {
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::get(
             "w:biz",
-            Jid::new("", SERVER_JID),
+            Jid::new("", Server::Pn),
             Some(NodeContent::Nodes(vec![
                 NodeBuilder::new("business_profile")
                     .attr("v", "244")
-                    .children([NodeBuilder::new("profile")
-                        .attr("jid", self.jid.clone())
-                        .build()])
+                    .children([NodeBuilder::new("profile").attr("jid", &self.jid).build()])
                     .build(),
             ])),
         )
     }
 
-    fn parse_response(&self, response: &Node) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
         let biz_node = match response.get_optional_child("business_profile") {
             Some(n) => n,
             None => return Ok(None),
@@ -181,8 +177,12 @@ impl IqSpec for BusinessProfileSpec {
                         Some(BusinessHoursConfig {
                             day_of_week: DayOfWeek::from(day.as_ref()),
                             mode: BusinessHourMode::from(mode_str.as_ref()),
-                            open_time: optional_attr(c, "open_time").map(|s| s.into_owned()),
-                            close_time: optional_attr(c, "close_time").map(|s| s.into_owned()),
+                            open_time: optional_attr(c, "open_time")
+                                .and_then(|s| s.parse::<u32>().ok())
+                                .unwrap_or(0),
+                            close_time: optional_attr(c, "close_time")
+                                .and_then(|s| s.parse::<u32>().ok())
+                                .unwrap_or(0),
                         })
                     })
                     .collect();

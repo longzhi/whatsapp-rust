@@ -39,9 +39,10 @@ default-members = [
 ]
 
 [workspace.dependencies]
+aead = { version = "0.6.0-rc.10", default-features = false, features = ["bytes"] }
 # Shared dependencies
-aes = "0.8.3"
-aes-gcm = { version = "0.10.2", default-features = false, features = ["aes", "alloc", "std"] }
+aes = "0.9.0"
+aes-gcm = { version = "0.11.0-rc.3", default-features = false, features = ["aes", "alloc", "bytes"] }
 anyhow = { version = "1.0", default-features = false }
 async-channel = { version = "2.5.0", default-features = false, features = ["std"] }
 async-lock = { version = "3", default-features = false }
@@ -50,25 +51,26 @@ base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 bytemuck = { version = "1.22", default-features = false }
 bytes = { version = "1.5", default-features = false, features = ["serde"] }
 chrono = { version = "0.4", default-features = false }
-ctr = { version = "0.9", default-features = false }
+compact_str = { version = "0.9", default-features = false }
+ctr = { version = "0.10", default-features = false }
 event-listener = { version = "5", default-features = false }
 flate2 = { version = "1.1.5", default-features = false, features = ["zlib-rs"] }
 futures = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
 getrandom = { version = "0.4", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
-hkdf = { version = "0.12.3", default-features = false }
-hmac = { version = "0.12.1", default-features = false, features = ["reset"] }
+hkdf = { version = "0.13.0", default-features = false }
+hmac = { version = "0.13.0", default-features = false }
 iai-callgrind = "0.16"
 log = "0.4"
 portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
 prost = { version = "0.14.3", default-features = false, features = ["std"] }
 prost-build = { version = "0.14.3", default-features = false }
 rand = "0.10"
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde-big-array = "0.5"
 serde_json = { version = "1.0", default-features = false }
-sha1 = { version = "0.10.6", default-features = false }
-sha2 = { version = "0.10.6", default-features = false }
+sha1 = { version = "0.11.0", default-features = false }
+sha2 = { version = "0.11.0", default-features = false }
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", default-features = false }
 uuid = { version = "1", default-features = false }
@@ -81,6 +83,7 @@ wacore-derive = { path = "./wacore/derive", version = "0.5.0" }
 wacore-libsignal = { path = "./wacore/libsignal", version = "0.5.0" }
 wacore-noise = { path = "./wacore/noise", version = "0.5.0" }
 waproto = { path = "./waproto", version = "0.5.0" }
+yoke = { version = "0.7", features = ["derive"] }
 
 [features]
 debug-diagnostics = ["wacore/debug-diagnostics"]
@@ -106,6 +109,7 @@ sqlite-storage = ["whatsapp-rust-sqlite-storage"]
 tokio-native = ["tokio-runtime", "tokio/rt-multi-thread"]
 
 [dependencies]
+aead = { workspace = true }
 anyhow = { workspace = true }
 async-channel = { workspace = true }
 async-lock = { workspace = true }

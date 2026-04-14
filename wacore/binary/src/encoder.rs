@@ -359,12 +359,12 @@ fn split_jid_from_meta(input: &str, meta: ParsedJidMeta) -> (&str, &str) {
 /// (instead of only as a fallback) was the root cause of a regression
 /// where LID group messages were silently rejected by the server (error 421).
 #[inline]
-fn server_to_domain_type(server: &str, agent: u8) -> u8 {
+fn server_to_domain_type(server: jid::Server, agent: u8) -> u8 {
     match server {
-        jid::HIDDEN_USER_SERVER => 1,  // "lid"
-        jid::HOSTED_SERVER => 128,     // "hosted"
-        jid::HOSTED_LID_SERVER => 129, // "hosted.lid"
-        _ => agent,                    // s.whatsapp.net (0) and exotic servers
+        jid::Server::Lid => 1,
+        jid::Server::Hosted => 128,
+        jid::Server::HostedLid => 129,
+        _ => agent,
     }
 }
 
@@ -556,7 +556,7 @@ fn owned_jid_encoded_size_with_cache(jid: &Jid, hints: &mut StringHintCache) -> 
         } else {
             string_encoded_size_with_cache(&jid.user, hints)
         };
-        1 + user_size + string_encoded_size_with_cache(&jid.server, hints)
+        1 + user_size + string_encoded_size_with_cache(jid.server.as_str(), hints)
     }
 }
 
@@ -570,7 +570,7 @@ fn jid_ref_encoded_size_with_cache(jid: &JidRef<'_>, hints: &mut StringHintCache
         } else {
             string_encoded_size_with_cache(&jid.user, hints)
         };
-        1 + user_size + string_encoded_size_with_cache(&jid.server, hints)
+        1 + user_size + string_encoded_size_with_cache(jid.server.as_str(), hints)
     }
 }
 
@@ -753,7 +753,7 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
                 BinaryError::AttrParse(format!("AD_JID device id out of range: {}", jid.device))
             })?;
             self.write_u8(token::AD_JID)?;
-            self.write_u8(server_to_domain_type(&jid.server, jid.agent))?;
+            self.write_u8(server_to_domain_type(jid.server, jid.agent))?;
             self.write_u8(device)?;
             self.write_string(&jid.user)?;
         } else {
@@ -764,7 +764,7 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
             } else {
                 self.write_string(&jid.user)?;
             }
-            self.write_string(&jid.server)?;
+            self.write_string(jid.server.as_str())?;
         }
         Ok(())
     }
@@ -778,7 +778,7 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
                 BinaryError::AttrParse(format!("AD_JID device id out of range: {}", jid.device))
             })?;
             self.write_u8(token::AD_JID)?;
-            self.write_u8(server_to_domain_type(jid.server.as_ref(), jid.agent))?;
+            self.write_u8(server_to_domain_type(jid.server, jid.agent))?;
             self.write_u8(device)?;
             self.write_string(&jid.user)?;
         } else {
@@ -789,7 +789,7 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
             } else {
                 self.write_string(&jid.user)?;
             }
-            self.write_string(&jid.server)?;
+            self.write_string(jid.server.as_str())?;
         }
         Ok(())
     }
@@ -938,7 +938,7 @@ mod tests {
         let node = Node::new(
             "message",
             Attrs::new(),
-            Some(NodeContent::String("receipt".to_string())),
+            Some(NodeContent::String("receipt".into())),
         );
 
         let mut buffer = Vec::new();
@@ -958,7 +958,7 @@ mod tests {
         let node = Node::new(
             "test",
             Attrs::new(),
-            Some(NodeContent::String(test_str.to_string())),
+            Some(NodeContent::String(test_str.into())),
         );
 
         let mut buffer = Vec::new();
@@ -1166,7 +1166,7 @@ mod tests {
         attrs.insert("key", ""); // Empty value
         attrs.insert("", "value"); // Empty key
 
-        let node = Node::new("test", attrs, Some(NodeContent::String("".to_string())));
+        let node = Node::new("test", attrs, Some(NodeContent::String("".into())));
 
         let mut buffer = Vec::new();
         let mut encoder = Encoder::new(Cursor::new(&mut buffer))?;
@@ -1178,11 +1178,11 @@ mod tests {
         assert_eq!(decoded.tag, "test");
         assert_eq!(
             decoded.attrs.get("key"),
-            Some(&NodeValue::String("".to_string()))
+            Some(&NodeValue::String("".into()))
         );
         assert_eq!(
             decoded.attrs.get(""),
-            Some(&NodeValue::String("value".to_string()))
+            Some(&NodeValue::String("value".into()))
         );
 
         // Empty strings are encoded as BINARY_8 + 0, which decodes as empty bytes
@@ -1230,7 +1230,7 @@ mod tests {
         let node = Node::new(
             "msg",
             Attrs::new(),
-            Some(NodeContent::String(long_text.clone())),
+            Some(NodeContent::String(long_text.as_str().into())),
         );
         let mut buffer = Vec::new();
         let mut encoder = Encoder::new(Cursor::new(&mut buffer))?;
@@ -1257,11 +1257,7 @@ mod tests {
         use crate::decoder::Decoder;
 
         let value = "foo:bar@s.whatsapp.net";
-        let node = Node::new(
-            "msg",
-            Attrs::new(),
-            Some(NodeContent::String(value.to_string())),
-        );
+        let node = Node::new("msg", Attrs::new(), Some(NodeContent::String(value.into())));
 
         let mut buffer = Vec::new();
         let mut encoder = Encoder::new(Cursor::new(&mut buffer))?;
@@ -1281,11 +1277,7 @@ mod tests {
         use crate::decoder::Decoder;
 
         let value = "hello_world@s.whatsapp.net";
-        let node = Node::new(
-            "msg",
-            Attrs::new(),
-            Some(NodeContent::String(value.to_string())),
-        );
+        let node = Node::new("msg", Attrs::new(), Some(NodeContent::String(value.into())));
 
         let mut buffer = Vec::new();
         let mut encoder = Encoder::new(Cursor::new(&mut buffer))?;
@@ -1416,8 +1408,7 @@ mod tests {
                 "Round-trip device mismatch for {jid}"
             );
             assert_eq!(
-                jid.server.as_ref(),
-                decoded_jid.server.as_ref(),
+                jid.server, decoded_jid.server,
                 "Round-trip server mismatch for {jid}"
             );
         }

@@ -14,11 +14,15 @@ use wacore::libsignal::protocol::{
 use wacore::libsignal::store::PreKeyStore;
 use wacore::protocol::ProtocolNode;
 use wacore::types::jid::JidExt;
+use wacore_binary::JidExt as _;
+use wacore_binary::OwnedNodeRef;
 use wacore_binary::builder::NodeBuilder;
-use wacore_binary::jid::JidExt as _;
-use wacore_binary::node::{Node, NodeContent};
+#[cfg(test)]
+use wacore_binary::{Node, NodeContent};
+use wacore_binary::{NodeContentRef, NodeRef};
 
-/// Helper to extract bytes content from a Node.
+/// Helper to extract bytes content from a Node (used in tests).
+#[cfg(test)]
 fn get_bytes_content(node: &Node) -> Option<&[u8]> {
     match &node.content {
         Some(NodeContent::Bytes(b)) => Some(b.as_slice()),
@@ -26,10 +30,36 @@ fn get_bytes_content(node: &Node) -> Option<&[u8]> {
     }
 }
 
-/// Helper to extract registration ID from a node (4 bytes big-endian).
+/// Helper to extract bytes content from a NodeRef.
+fn get_bytes_content_ref<'a>(node: &'a NodeRef<'_>) -> Option<&'a [u8]> {
+    match node.content.as_deref() {
+        Some(NodeContentRef::Bytes(b)) => Some(b.as_ref()),
+        _ => None,
+    }
+}
+
+/// Helper to extract registration ID from a Node (used in tests).
+#[cfg(test)]
 fn extract_registration_id_from_node(node: &Node) -> Option<u32> {
     let registration_node = node.get_optional_child("registration")?;
     let bytes = get_bytes_content(registration_node)?;
+
+    if bytes.len() >= 4 {
+        Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    } else if !bytes.is_empty() {
+        let mut arr = [0u8; 4];
+        let start = 4 - bytes.len();
+        arr[start..].copy_from_slice(bytes);
+        Some(u32::from_be_bytes(arr))
+    } else {
+        None
+    }
+}
+
+/// Helper to extract registration ID from a NodeRef (4 bytes big-endian).
+fn extract_registration_id_from_node_ref(node: &NodeRef<'_>) -> Option<u32> {
+    let registration_node = node.get_optional_child("registration")?;
+    let bytes = get_bytes_content_ref(registration_node)?;
 
     if bytes.len() >= 4 {
         Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
@@ -56,20 +86,21 @@ impl Client {
     pub(crate) async fn handle_retry_receipt(
         self: &Arc<Self>,
         receipt: &Receipt,
-        node: &Node,
+        node: &Arc<OwnedNodeRef>,
     ) -> Result<(), anyhow::Error> {
-        let retry_child = node
+        let nr = node.get();
+        let retry_child = nr
             .get_optional_child("retry")
             .ok_or_else(|| anyhow::anyhow!("<retry> child missing from receipt"))?;
 
         let message_id = retry_child
-            .attrs()
-            .optional_string("id")
+            .get_attr("id")
+            .map(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("<retry> missing 'id' attribute"))?
-            .to_string();
+            .into_owned();
         let retry_count: u8 = retry_child
-            .attrs()
-            .optional_string("count")
+            .get_attr("count")
+            .map(|v| v.as_str())
             .and_then(|s| s.parse().ok())
             .unwrap_or(1);
 
@@ -89,13 +120,12 @@ impl Client {
         // For groups/status broadcasts, the actual participant is in the
         // `participant` attribute of the receipt node, NOT receipt.source.sender
         // (which may be the group/broadcast JID for non-group servers).
-        let participant_str = if is_group_or_status {
-            node.attrs()
-                .optional_string("participant")
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| receipt.source.sender.to_string())
+        let participant_jid = if is_group_or_status {
+            nr.attrs()
+                .optional_jid("participant")
+                .unwrap_or_else(|| receipt.source.sender.clone())
         } else {
-            receipt.source.sender.to_string()
+            receipt.source.sender.clone()
         };
 
         // Deduplicate retry receipts to prevent processing the same retry multiple times.
@@ -103,7 +133,7 @@ impl Client {
         // For DMs: key is (chat, msg_id) since there's only one sender.
         // Uses atomic entry API to avoid race conditions between check and insert.
         let dedupe_key = if is_group_or_status {
-            format!("{}:{}:{}", receipt.source.chat, message_id, participant_str)
+            format!("{}:{}:{}", receipt.source.chat, message_id, participant_jid)
         } else {
             format!("{}:{}", receipt.source.chat, message_id)
         };
@@ -140,7 +170,7 @@ impl Client {
         });
 
         let original_msg = match self
-            .take_recent_message(receipt.source.chat.clone(), message_id.clone())
+            .take_recent_message(&receipt.source.chat, &message_id)
             .await
         {
             Some(msg) => msg,
@@ -156,19 +186,9 @@ impl Client {
         // take_recent_message consumed it; without this a second participant's
         // retry would silently fail with "not found in cache".
         if is_group_or_status {
-            self.add_recent_message(
-                receipt.source.chat.clone(),
-                message_id.clone(),
-                &original_msg,
-            )
-            .await;
+            self.add_recent_message(&receipt.source.chat, &message_id, &original_msg)
+                .await;
         }
-
-        // Reuse the participant string extracted earlier (same source: node's
-        // `participant` attribute for groups/status, receipt.source.sender for DMs).
-        let participant_jid = participant_str
-            .parse::<wacore_binary::jid::Jid>()
-            .unwrap_or_else(|_| receipt.source.sender.clone());
 
         // Resolved JID for session operations; keep original for stanza addressing
         let resolved_jid = self.resolve_encryption_jid(&participant_jid).await;
@@ -200,7 +220,7 @@ impl Client {
         if !receipt.source.chat.is_status_broadcast() {
             // Try to process key bundle if present
             let key_bundle_result = self
-                .process_retry_key_bundle(node, &resolved_jid, is_peer)
+                .process_retry_key_bundle(nr, &resolved_jid, is_peer)
                 .await;
 
             if let Err(e) = &key_bundle_result {
@@ -212,7 +232,7 @@ impl Client {
                 // WhatsApp Web behavior: If no key bundle but registration ID differs from stored
                 // session, delete the session to force re-establishment.
                 // This handles the case where the requester reinstalled but didn't include keys.
-                if let Some(received_reg_id) = extract_registration_id_from_node(node) {
+                if let Some(received_reg_id) = extract_registration_id_from_node_ref(nr) {
                     let signal_address = resolved_jid.to_protocol_address();
                     let device_store = self.persistence_manager.get_device_arc().await;
                     let device_guard = device_store.read().await;
@@ -220,7 +240,7 @@ impl Client {
                     // Read session through cache to get consistent state
                     let session = self
                         .signal_cache
-                        .get_session(&signal_address, &*device_guard.backend)
+                        .peek_session(&signal_address, &*device_guard.backend)
                         .await
                         .ok()
                         .flatten();
@@ -236,10 +256,12 @@ impl Client {
                              Deleting session since no key bundle provided.",
                             signal_address, stored_reg_id, received_reg_id
                         );
+                        let lock = self.session_lock_for(signal_address.as_str()).await;
+                        let _guard = lock.lock().await;
                         self.signal_cache.delete_session(&signal_address).await;
-                        if let Err(e) = self.flush_signal_cache().await {
-                            log::warn!("Failed to flush session deletion for reg ID mismatch: {e}");
-                        }
+                        drop(_guard);
+                        self.flush_signal_cache_logged("reg ID mismatch session deletion", None)
+                            .await;
                     }
                 }
             }
@@ -282,7 +304,7 @@ impl Client {
                     log::warn!(
                         "Unknown device {} in group {} — forcing full sender key rotation \
                          (matches WA Web's rotateKey behavior)",
-                        participant_str,
+                        participant_jid,
                         group_jid
                     );
 
@@ -313,10 +335,8 @@ impl Client {
 
                     for own_jid in jids_to_delete {
                         use wacore::libsignal::store::sender_key_name::SenderKeyName;
-                        let sk_name = SenderKeyName::new(
-                            group_jid.clone(),
-                            own_jid.to_protocol_address().to_string(),
-                        );
+                        let sk_name =
+                            SenderKeyName::from_jid(&group_jid, &own_jid.to_protocol_address());
                         self.signal_cache
                             .delete_sender_key(sk_name.cache_key())
                             .await;
@@ -371,7 +391,7 @@ impl Client {
                 let device_guard = device_store.read().await;
                 let session = self
                     .signal_cache
-                    .get_session(&signal_address, &*device_guard.backend)
+                    .peek_session(&signal_address, &*device_guard.backend)
                     .await
                     .ok()
                     .flatten();
@@ -511,8 +531,8 @@ impl Client {
     /// * `is_peer` - Whether this is a peer device (our own device)
     async fn process_retry_key_bundle(
         &self,
-        node: &Node,
-        requester_jid: &wacore_binary::jid::Jid,
+        node: &NodeRef<'_>,
+        requester_jid: &wacore_binary::Jid,
         is_peer: bool,
     ) -> Result<(), anyhow::Error> {
         let keys_node = node
@@ -523,7 +543,7 @@ impl Client {
 
         // Extract registration ID (4 bytes big-endian).
         let registration_id = registration_node
-            .and_then(get_bytes_content)
+            .and_then(get_bytes_content_ref)
             .map(|bytes| {
                 if bytes.len() >= 4 {
                     u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
@@ -553,7 +573,7 @@ impl Client {
             let device_guard = device_store.read().await;
             let session = self
                 .signal_cache
-                .get_session(&signal_address, &*device_guard.backend)
+                .peek_session(&signal_address, &*device_guard.backend)
                 .await
                 .ok()
                 .flatten();
@@ -584,16 +604,13 @@ impl Client {
         // Extract identity key.
         let identity_bytes = keys_node
             .get_optional_child("identity")
-            .and_then(get_bytes_content)
+            .and_then(get_bytes_content_ref)
             .ok_or_else(|| anyhow::anyhow!("Missing identity key in retry receipt"))?;
         let identity_key = PublicKey::from_djb_public_key_bytes(identity_bytes)?;
 
         // Extract prekey (optional in some cases).
-        let prekey_node = keys_node
-            .get_optional_child("key")
-            .map(OneTimePreKeyNode::try_from_node)
-            .transpose()?;
-        let prekey_data = if let Some(prekey_node) = prekey_node {
+        let prekey_data = if let Some(key_ref) = keys_node.get_optional_child("key") {
+            let prekey_node = OneTimePreKeyNode::try_from_node_ref(key_ref)?;
             let prekey_public = PublicKey::from_djb_public_key_bytes(&prekey_node.public_bytes)?;
             Some((prekey_node.id.into(), prekey_public))
         } else {
@@ -601,11 +618,11 @@ impl Client {
         };
 
         // Extract signed prekey.
-        let skey_node = keys_node
+        let skey_ref = keys_node
             .get_optional_child("skey")
             .ok_or_else(|| anyhow::anyhow!("Missing signed prekey in retry receipt"))?;
 
-        let signed_prekey = SignedPreKeyNode::try_from_node(skey_node)?;
+        let signed_prekey = SignedPreKeyNode::try_from_node_ref(skey_ref)?;
         let skey_public = PublicKey::from_djb_public_key_bytes(&signed_prekey.public_bytes)?;
         let skey_signature: [u8; 64] = signed_prekey
             .signature
@@ -785,12 +802,12 @@ impl Client {
         // to identify which group member should resend. For DMs, omit it since the
         // "to" address already identifies the sender.
         let mut builder = NodeBuilder::new("receipt")
-            .attr("to", receipt_to.clone())
+            .attr("to", receipt_to)
             .attr("id", info.id.clone())
             .attr("type", "retry");
 
         if info.source.is_group {
-            builder = builder.attr("participant", info.source.sender.clone());
+            builder = builder.attr("participant", &info.source.sender);
         }
 
         // Handle peer vs device sync messages (matches WhatsApp Web's sendRetryReceipt):
@@ -814,7 +831,7 @@ impl Client {
                     // Include recipient so the sender can look up the original message.
                     // Without this, the retry fails silently (getTargetChat returns null).
                     let recipient = info.source.recipient.as_ref().unwrap_or(&info.source.chat);
-                    builder = builder.attr("recipient", recipient.clone());
+                    builder = builder.attr("recipient", recipient);
                 }
             }
         }
@@ -845,9 +862,9 @@ impl Client {
     pub(crate) async fn send_enc_rekey_retry_receipt(
         &self,
         stanza_id: &str,
-        peer_jid: &wacore_binary::jid::Jid,
+        peer_jid: &wacore_binary::Jid,
         call_id: &str,
-        call_creator: &wacore_binary::jid::Jid,
+        call_creator: &wacore_binary::Jid,
         retry_count: u8,
     ) -> Result<(), anyhow::Error> {
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
@@ -856,7 +873,7 @@ impl Client {
 
         // WA Web: <enc_rekey call-creator="JID" call-id="..." count="N"/>
         let enc_rekey_node = NodeBuilder::new("enc_rekey")
-            .attr("call-creator", call_creator.clone())
+            .attr("call-creator", call_creator)
             .attr("call-id", call_id)
             .attr("count", retry_count.to_string())
             .build();
@@ -866,7 +883,7 @@ impl Client {
             .build();
 
         let receipt_node = NodeBuilder::new("receipt")
-            .attr("to", peer_jid.clone())
+            .attr("to", peer_jid)
             .attr("id", stanza_id)
             .attr("type", "enc_rekey_retry")
             .children([enc_rekey_node, registration_node])
@@ -888,7 +905,7 @@ mod tests {
     use crate::store::persistence_manager::PersistenceManager;
     use crate::test_utils::MockHttpClient;
     use std::borrow::Cow;
-    use wacore_binary::jid::{Jid, JidExt};
+    use wacore_binary::{Jid, JidExt};
     use waproto::whatsapp as wa;
 
     #[tokio::test]
@@ -924,14 +941,10 @@ mod tests {
         };
 
         // Insert via the new async API
-        client
-            .add_recent_message(chat.clone(), msg_id.clone(), &msg)
-            .await;
+        client.add_recent_message(&chat, &msg_id, &msg).await;
 
         // First take should return and remove it from cache
-        let taken = client
-            .take_recent_message(chat.clone(), msg_id.clone())
-            .await;
+        let taken = client.take_recent_message(&chat, &msg_id).await;
         assert!(taken.is_some());
         assert_eq!(
             taken
@@ -942,13 +955,13 @@ mod tests {
         );
 
         // Second take should return None
-        let taken_again = client.take_recent_message(chat, msg_id).await;
+        let taken_again = client.take_recent_message(&chat, &msg_id).await;
         assert!(taken_again.is_none());
     }
 
     #[test]
     fn get_bytes_content_extracts_bytes() {
-        use wacore_binary::node::{Attrs, Node};
+        use wacore_binary::{Attrs, Node};
 
         // Test with bytes content
         let node = Node {
@@ -962,7 +975,7 @@ mod tests {
         let node_str = Node {
             tag: Cow::Borrowed("test"),
             attrs: Attrs::new(),
-            content: Some(NodeContent::String("hello".to_string())),
+            content: Some(NodeContent::String("hello".into())),
         };
         assert_eq!(get_bytes_content(&node_str), None);
 
@@ -1000,14 +1013,20 @@ mod tests {
             info: &MessageInfo,
             our_pn: &Jid,
             our_lid: &Jid,
-        ) -> wacore_binary::node::Node {
+        ) -> wacore_binary::Node {
+            // Mirror production routing: groups → chat JID, DMs → sender JID
+            let receipt_to = if info.source.is_group {
+                &info.source.chat
+            } else {
+                &info.source.sender
+            };
             let mut builder = NodeBuilder::new("receipt")
-                .attr("to", info.source.sender.clone())
+                .attr("to", receipt_to)
                 .attr("id", info.id.clone())
                 .attr("type", "retry");
 
             if info.source.is_group {
-                builder = builder.attr("participant", info.source.sender.clone());
+                builder = builder.attr("participant", &info.source.sender);
             }
 
             if !info.source.is_group {
@@ -1019,7 +1038,7 @@ mod tests {
                         builder = builder.attr("category", MessageCategory::Peer.as_str());
                     } else {
                         let recipient = info.source.recipient.as_ref().unwrap_or(&info.source.chat);
-                        builder = builder.attr("recipient", recipient.clone());
+                        builder = builder.attr("recipient", recipient);
                     }
                 }
             }
@@ -1223,7 +1242,7 @@ mod tests {
             .get_optional_child("registration")
             .expect("<registration> child must exist");
         let reg_bytes = match &registration.content {
-            Some(wacore_binary::node::NodeContent::Bytes(b)) => b.clone(),
+            Some(wacore_binary::NodeContent::Bytes(b)) => b.clone(),
             _ => panic!("registration must contain bytes"),
         };
         assert_eq!(
@@ -1403,7 +1422,7 @@ mod tests {
     #[test]
     fn bot_jid_detection() {
         // Test bot JID detection for bot message filtering
-        use wacore_binary::jid::JidExt as _;
+        use wacore_binary::JidExt as _;
 
         // Regular user JID - not a bot
         let regular_user: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
@@ -1428,7 +1447,7 @@ mod tests {
 
     #[test]
     fn extract_registration_id_from_node_test() {
-        use wacore_binary::node::{Attrs, Node};
+        use wacore_binary::{Attrs, Node};
 
         // Test with 4-byte registration ID
         let reg_bytes = vec![0x00, 0x01, 0x02, 0x03]; // = 66051
@@ -1486,7 +1505,7 @@ mod tests {
     #[test]
     fn group_or_status_detection_for_sender_key_handling() {
         // Test that both groups and status broadcasts trigger sender key handling
-        use wacore_binary::jid::JidExt as _;
+        use wacore_binary::JidExt as _;
 
         let group: Jid = "120363021033254949@g.us".parse().unwrap();
         let status: Jid = "status@broadcast".parse().unwrap();
@@ -1719,19 +1738,15 @@ mod tests {
         let is_group_or_status = true;
         let fallback_sender: Jid = "status@broadcast".parse().unwrap();
 
-        let participant_str = if is_group_or_status {
+        let participant_jid = if is_group_or_status {
             node.attrs()
-                .optional_string("participant")
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| fallback_sender.to_string())
+                .optional_jid("participant")
+                .unwrap_or_else(|| fallback_sender.clone())
         } else {
-            fallback_sender.to_string()
+            fallback_sender.clone()
         };
 
         // Should extract the actual participant, not status@broadcast
-        assert_eq!(participant_str, "236395184570386@lid");
-
-        let participant_jid: Jid = participant_str.parse().unwrap();
         assert!(participant_jid.is_lid());
         assert_eq!(participant_jid.user, "236395184570386");
         assert!(!participant_jid.is_status_broadcast());
@@ -1751,14 +1766,13 @@ mod tests {
 
         let fallback_sender: Jid = "status@broadcast".parse().unwrap();
 
-        let participant_str = node
+        let participant_jid = node
             .attrs()
-            .optional_string("participant")
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| fallback_sender.to_string());
+            .optional_jid("participant")
+            .unwrap_or_else(|| fallback_sender.clone());
 
         // Falls back to sender (status@broadcast) — not ideal but won't crash
-        assert_eq!(participant_str, "status@broadcast");
+        assert!(participant_jid.is_status_broadcast());
     }
 
     /// Test that dedupe keys are correctly differentiated per-participant
@@ -1821,26 +1835,18 @@ mod tests {
         };
 
         // Add message to cache
-        client
-            .add_recent_message(chat.clone(), msg_id.clone(), &msg)
-            .await;
+        client.add_recent_message(&chat, &msg_id, &msg).await;
 
         // First device takes the message
-        let taken = client
-            .take_recent_message(chat.clone(), msg_id.clone())
-            .await;
+        let taken = client.take_recent_message(&chat, &msg_id).await;
         assert!(taken.is_some(), "First take should succeed");
 
         // Re-add for subsequent retries (simulating the status broadcast fix)
         let taken_msg = taken.unwrap();
-        client
-            .add_recent_message(chat.clone(), msg_id.clone(), &taken_msg)
-            .await;
+        client.add_recent_message(&chat, &msg_id, &taken_msg).await;
 
         // Second device should also be able to take the message
-        let taken2 = client
-            .take_recent_message(chat.clone(), msg_id.clone())
-            .await;
+        let taken2 = client.take_recent_message(&chat, &msg_id).await;
         assert!(
             taken2.is_some(),
             "Second take should succeed after re-add (status broadcast multi-device retry)"

@@ -11,7 +11,7 @@
 
 use anyhow::Result;
 use log::debug;
-use wacore_binary::jid::Jid;
+use wacore_binary::Jid;
 
 use super::Client;
 use crate::lid_pn_cache::{LearningSource, LidPnEntry};
@@ -136,18 +136,15 @@ impl Client {
     /// For PN JIDs, this checks if a LID mapping exists and returns the LID.
     /// This ensures that sending and receiving use the same session lock.
     pub(crate) async fn resolve_encryption_jid(&self, target: &Jid) -> Jid {
-        let pn_server = wacore_binary::jid::DEFAULT_USER_SERVER;
-        let lid_server = wacore_binary::jid::HIDDEN_USER_SERVER;
-
-        if target.server == lid_server {
+        if target.is_lid() {
             // Already a LID - use it directly
             target.clone()
-        } else if target.server == pn_server {
+        } else if target.is_pn() {
             // PN JID - check if we have a LID mapping
             if let Some(lid_user) = self.lid_pn_cache.get_current_lid(&target.user).await {
                 let lid_jid = Jid {
-                    user: lid_user,
-                    server: wacore_binary::jid::cow_server_from_str(lid_server),
+                    user: lid_user.into(),
+                    server: wacore_binary::Server::Lid,
                     device: target.device,
                     agent: target.agent,
                     integrator: target.integrator,
@@ -186,26 +183,35 @@ impl Client {
             let pn_proto = pn_jid.to_protocol_address();
             let lid_proto = lid_jid.to_protocol_address();
 
-            // Migrate session: read from cache (authoritative), write to cache
+            // Migrate session: take from cache (authoritative), write to cache
             if let Ok(Some(session)) = self
                 .signal_cache
                 .get_session(&pn_proto, backend.as_ref())
                 .await
             {
-                if self
+                match self
                     .signal_cache
-                    .get_session(&lid_proto, backend.as_ref())
+                    .has_session(&lid_proto, backend.as_ref())
                     .await
-                    .ok()
-                    .flatten()
-                    .is_some()
                 {
-                    self.signal_cache.delete_session(&pn_proto).await;
-                    info!("Deleted stale PN session {} (LID exists)", pn_proto);
-                } else {
-                    self.signal_cache.put_session(&lid_proto, session).await;
-                    self.signal_cache.delete_session(&pn_proto).await;
-                    info!("Migrated session {} -> {}", pn_proto, lid_proto);
+                    Ok(true) => {
+                        self.signal_cache.delete_session(&pn_proto).await;
+                        info!("Deleted stale PN session {} (LID exists)", pn_proto);
+                    }
+                    Ok(false) => {
+                        self.signal_cache.put_session(&lid_proto, session).await;
+                        self.signal_cache.delete_session(&pn_proto).await;
+                        info!("Migrated session {} -> {}", pn_proto, lid_proto);
+                    }
+                    Err(e) => {
+                        // Restore the taken PN session to avoid losing it
+                        self.signal_cache.put_session(&pn_proto, session).await;
+                        log::warn!(
+                            "Skipping session migration {} -> {}: {e}",
+                            pn_proto,
+                            lid_proto
+                        );
+                    }
                 }
             }
 
@@ -238,24 +244,18 @@ impl Client {
         }
     }
 
-    /// Get the phone number (user part) for a given LID.
-    /// Looks up the LID-PN mapping from the in-memory cache.
+    /// Look up the LID↔phone mapping for a JID.
     ///
-    /// # Arguments
-    ///
-    /// * `lid` - The LID user part (e.g., "100000012345678") or full JID (e.g., "100000012345678@lid")
-    ///
-    /// # Returns
-    ///
-    /// The phone number user part if a mapping exists, None otherwise.
-    pub async fn get_phone_number_from_lid(&self, lid: &str) -> Option<String> {
-        // Handle both full JID (e.g., "100000012345678@lid") and user part only
-        let lid_user = if lid.contains('@') {
-            lid.split('@').next().unwrap_or(lid)
+    /// Routes automatically: LID JIDs search by LID, PN JIDs search by phone.
+    /// Returns `None` for non-user JIDs (groups, newsletters, etc.).
+    pub async fn get_lid_pn_entry(&self, jid: &Jid) -> Option<LidPnEntry> {
+        if jid.is_lid() {
+            self.lid_pn_cache.get_entry_by_lid(&jid.user).await
+        } else if jid.is_pn() {
+            self.lid_pn_cache.get_entry_by_phone(&jid.user).await
         } else {
-            lid
-        };
-        self.lid_pn_cache.get_phone_number(lid_user).await
+            None
+        }
     }
 }
 
@@ -265,7 +265,7 @@ mod tests {
     use crate::lid_pn_cache::LearningSource;
     use crate::test_utils::create_test_client;
     use std::sync::Arc;
-    use wacore_binary::jid::HIDDEN_USER_SERVER;
+    use wacore_binary::Server;
 
     #[tokio::test]
     async fn test_resolve_encryption_jid_pn_to_lid() {
@@ -283,7 +283,7 @@ mod tests {
         let resolved = client.resolve_encryption_jid(&pn_jid).await;
 
         assert_eq!(resolved.user, lid);
-        assert_eq!(resolved.server, HIDDEN_USER_SERVER);
+        assert_eq!(resolved.server, Server::Lid);
     }
 
     #[tokio::test]
@@ -306,5 +306,41 @@ mod tests {
         let resolved = client.resolve_encryption_jid(&pn_jid).await;
 
         assert_eq!(resolved, pn_jid);
+    }
+
+    #[tokio::test]
+    async fn test_get_lid_pn_entry_from_pn() {
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "55999999999";
+        let lid = "100000012345678";
+
+        assert!(client.get_lid_pn_entry(&Jid::pn(pn)).await.is_none());
+
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::Usync)
+            .await
+            .unwrap();
+
+        let entry = client.get_lid_pn_entry(&Jid::pn(pn)).await.unwrap();
+        assert_eq!(entry.lid, lid);
+        assert_eq!(entry.phone_number, pn);
+    }
+
+    #[tokio::test]
+    async fn test_get_lid_pn_entry_from_lid() {
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "55999999999";
+        let lid = "100000012345678";
+
+        assert!(client.get_lid_pn_entry(&Jid::lid(lid)).await.is_none());
+
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::Usync)
+            .await
+            .unwrap();
+
+        let entry = client.get_lid_pn_entry(&Jid::lid(lid)).await.unwrap();
+        assert_eq!(entry.lid, lid);
+        assert_eq!(entry.phone_number, pn);
     }
 }

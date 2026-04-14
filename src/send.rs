@@ -6,11 +6,11 @@ use wacore::client::context::SendContextResolver;
 use wacore::libsignal::protocol::SignalProtocolError;
 use wacore::types::jid::JidExt;
 use wacore::types::message::AddressingMode;
-use wacore_binary::builder::NodeBuilder;
 #[cfg(test)]
-use wacore_binary::jid::DeviceKey;
-use wacore_binary::jid::{Jid, JidExt as _};
-use wacore_binary::node::Node;
+use wacore_binary::DeviceKey;
+use wacore_binary::Node;
+use wacore_binary::builder::NodeBuilder;
+use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
 
 /// Options for [`Client::send_message_with_options`].
@@ -180,6 +180,27 @@ fn button_name_to_flow_name(button_name: &str) -> &str {
     }
 }
 
+fn build_revoke_message(
+    remote_jid: &Jid,
+    from_me: bool,
+    message_id: String,
+    participant: Option<String>,
+) -> wa::Message {
+    wa::Message {
+        protocol_message: Some(Box::new(wa::message::ProtocolMessage {
+            key: Some(wa::MessageKey {
+                remote_jid: Some(remote_jid.to_string()),
+                from_me: Some(from_me),
+                id: Some(message_id),
+                participant,
+            }),
+            r#type: Some(wa::message::protocol_message::Type::Revoke as i32),
+            ..Default::default()
+        })),
+        ..Default::default()
+    }
+}
+
 impl Client {
     /// Send a message to a user, group, or newsletter.
     ///
@@ -289,18 +310,16 @@ impl Client {
         let to = Jid::status_broadcast();
         let request_id = self.generate_message_id().await;
 
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let mut device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let account_info = device_snapshot.account.take();
         let own_jid = device_snapshot
             .pn
-            .clone()
+            .take()
             .ok_or(crate::client::ClientError::NotLoggedIn)?;
-        // Status always uses PN addressing, so own_lid is only needed as a
-        // fallback parameter for prepare_group_stanza (unused in PN mode).
         let own_lid = device_snapshot
             .lid
-            .clone()
+            .take()
             .unwrap_or_else(|| own_jid.clone());
-        let account_info = device_snapshot.account.clone();
 
         // Status always uses PN addressing. Resolve any LID recipients to their
         // phone numbers so we don't end up with duplicate PN+LID entries for the
@@ -317,8 +336,7 @@ impl Client {
             }
             if jid.is_lid() {
                 if let Some(pn) = self.lid_pn_cache.get_phone_number(&jid.user).await {
-                    resolved_recipients
-                        .push(Jid::new(&pn, wacore_binary::jid::DEFAULT_USER_SERVER));
+                    resolved_recipients.push(Jid::new(&pn, Server::Pn));
                 } else {
                     return Err(anyhow!(
                         "No PN mapping for LID {}. Ensure the recipient has been \
@@ -351,8 +369,7 @@ impl Client {
             group_info.participants.push(own_base);
         }
 
-        self.add_recent_message(to.clone(), request_id.clone(), &message)
-            .await;
+        self.add_recent_message(&to, &request_id, &message).await;
 
         let device_store_arc = self.persistence_manager.get_device_arc().await;
         let to_str = to.to_string();
@@ -360,7 +377,7 @@ impl Client {
         let force_skdm = {
             use wacore::libsignal::store::sender_key_name::SenderKeyName;
             let sender_address = own_jid.to_protocol_address();
-            let sender_key_name = SenderKeyName::new(to_str.clone(), sender_address.to_string());
+            let sender_key_name = SenderKeyName::from_jid(&to_str, &sender_address);
 
             let device_guard = device_store_arc.read().await;
             let key_exists = self
@@ -465,20 +482,37 @@ impl Client {
             .ensure_status_participants(prepared.node, &group_info)
             .await?;
 
-        self.send_node(stanza).await?;
+        let ack = if let Some(phash) = stanza
+            .attrs()
+            .optional_string("phash")
+            .map(|s| s.into_owned())
+        {
+            let rx = self.register_ack_waiter(&request_id).await;
+            Some((rx, phash))
+        } else {
+            None
+        };
+
+        if let Err(e) = self.send_node(stanza).await {
+            if ack.is_some() {
+                self.response_waiters.lock().await.remove(&request_id);
+            }
+            return Err(e.into());
+        }
+
+        if let Some((rx, phash)) = ack {
+            self.spawn_phash_validation(rx, phash, to.clone(), true, request_id.clone());
+        }
 
         self.update_sender_key_devices(&to_str, &prepared.skdm_devices)
             .await;
 
-        // Invalidate device registry for users whose devices returned 406
         for user in &prepared.stale_device_users {
             self.invalidate_device_cache(user).await;
         }
 
-        // Flush cached Signal state to DB after encryption
-        if let Err(e) = self.flush_signal_cache().await {
-            log::error!("Failed to flush signal cache after send_status_message: {e:?}");
-        }
+        self.flush_signal_cache_logged("send_status_message", None)
+            .await;
 
         Ok(SendResult {
             message_id: request_id,
@@ -585,14 +619,8 @@ impl Client {
             return;
         }
 
-        // Write to DB first, then invalidate cache. Next read reloads from
-        // DB with the authoritative state. This avoids the clone+modify race
-        // where concurrent writers can overwrite each other's mutations.
-        let strs: Vec<String> = devices.iter().map(|j| j.to_string()).collect();
-        let entries: Vec<(&str, bool)> = strs.iter().map(|s| (s.as_str(), true)).collect();
         if let Err(e) = self
-            .persistence_manager
-            .set_sender_key_status(group_jid, &entries)
+            .set_sender_key_status_for_devices(group_jid, devices, true, false)
             .await
         {
             log::warn!(
@@ -602,6 +630,62 @@ impl Client {
             );
         }
         self.sender_key_device_cache.invalidate(group_jid).await;
+    }
+
+    /// Spawn a background task to validate phash from server ack.
+    /// On mismatch, invalidates sender key device cache and group info cache.
+    fn spawn_phash_validation(
+        &self,
+        rx: futures::channel::oneshot::Receiver<std::sync::Arc<wacore_binary::OwnedNodeRef>>,
+        our_phash: String,
+        jid: Jid,
+        invalidate_group_cache: bool,
+        message_id: String,
+    ) {
+        let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) else {
+            return;
+        };
+        self.runtime
+            .spawn(Box::pin(async move {
+                let ack = match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    rx,
+                )
+                .await
+                {
+                    Ok(Ok(node)) => node,
+                    _ => {
+                        // Remove leaked waiter to prevent keepalive suppression
+                        client.response_waiters.lock().await.remove(&message_id);
+                        return;
+                    }
+                };
+                if let Some(server) = ack.get().get_attr("phash").map(|v| v.as_str())
+                    && server != our_phash
+                {
+                    log::warn!(
+                        "Phash mismatch for {jid}: ours={our_phash}, server={server}. Invalidating caches."
+                    );
+                    // DM phash covers both recipient + own devices
+                    // (WA Web: syncDeviceListJob([recipient, me]))
+                    if !jid.is_group() && !jid.is_status_broadcast() {
+                        client.invalidate_device_cache(&jid.user).await;
+                        if let Some(own_pn) =
+                            &client.persistence_manager.get_device_snapshot().await.pn
+                        {
+                            client.invalidate_device_cache(&own_pn.user).await;
+                        }
+                    }
+                    client
+                        .sender_key_device_cache
+                        .invalidate(&jid.to_string())
+                        .await;
+                    if invalidate_group_cache {
+                        client.get_group_cache().await.invalidate(&jid).await;
+                    }
+                }
+            }))
+            .detach();
     }
 
     /// Ensure the status stanza has a <participants> node listing all recipient
@@ -666,19 +750,7 @@ impl Client {
             }
         };
 
-        let revoke_message = wa::Message {
-            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-                key: Some(wa::MessageKey {
-                    remote_jid: Some(to.to_string()),
-                    from_me: Some(from_me),
-                    id: Some(message_id.clone()),
-                    participant,
-                }),
-                r#type: Some(wa::message::protocol_message::Type::Revoke as i32),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
+        let revoke_message = build_revoke_message(&to, from_me, message_id, participant);
 
         // The revoke message stanza needs a NEW unique ID, not the message ID being revoked
         // The message_id being revoked is already in protocolMessage.key.id
@@ -794,13 +866,14 @@ impl Client {
         let mut used_cached_tc_token_key: Option<String> = None;
         let tc_issue_target = to.clone();
 
+        let mut dm_phash: Option<String> = None;
         let stanza_to_send: wacore_binary::Node = if peer && !to.is_group() {
             // Peer messages are only valid for individual users, not groups
             // Resolve encryption JID and acquire lock ONLY for encryption
             let encryption_jid = self.resolve_encryption_jid(&to).await;
-            let signal_addr_str = encryption_jid.to_protocol_address_string();
+            let signal_addr = encryption_jid.to_protocol_address();
 
-            let session_mutex = self.session_lock_for(&signal_addr_str).await;
+            let session_mutex = self.session_lock_for(signal_addr.as_str()).await;
             let _session_guard = session_mutex.lock().await;
 
             let mut store_adapter = self.signal_adapter().await;
@@ -822,20 +895,19 @@ impl Client {
             // Preparation work (no lock needed)
             let mut group_info = self.groups().query_info(&to).await?;
 
-            let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+            let mut device_snapshot = self.persistence_manager.get_device_snapshot().await;
+            let account_info = device_snapshot.account.take();
             let own_jid = device_snapshot
                 .pn
-                .clone()
+                .take()
                 .ok_or(crate::client::ClientError::NotLoggedIn)?;
             let own_lid = device_snapshot
                 .lid
-                .clone()
+                .take()
                 .ok_or_else(|| anyhow!("LID not set, cannot send to group"))?;
-            let account_info = device_snapshot.account.clone();
 
             // Store serialized message bytes for retry (lightweight)
-            self.add_recent_message(to.clone(), request_id.clone(), message)
-                .await;
+            self.add_recent_message(&to, &request_id, message).await;
 
             let device_store_arc = self.persistence_manager.get_device_arc().await;
             let to_str = to.to_string();
@@ -856,8 +928,7 @@ impl Client {
             let force_skdm = {
                 use wacore::libsignal::store::sender_key_name::SenderKeyName;
                 let sender_address = own_sending_jid.to_protocol_address();
-                let sender_key_name =
-                    SenderKeyName::new(to_str.clone(), sender_address.to_string());
+                let sender_key_name = SenderKeyName::from_jid(&to_str, &sender_address);
 
                 let device_guard = device_store_arc.read().await;
                 let key_exists = self
@@ -958,8 +1029,7 @@ impl Client {
             // Per-device locking to match decrypt path (message.rs:684),
             // preventing ratchet desync on concurrent send/receive.
 
-            self.add_recent_message(to.clone(), request_id.clone(), message)
-                .await;
+            self.add_recent_message(&to, &request_id, message).await;
 
             let device_snapshot = self.persistence_manager.get_device_snapshot().await;
             let own_jid = device_snapshot
@@ -997,16 +1067,55 @@ impl Client {
                 }
             }
 
-            // Bare recipient (WA Web: MsgCreateFanoutStanza)
+            // DM fanout: all known recipient devices + own companions.
+            // WAWebSendUserMsgJob reads local device table only on the send
+            // path; WAWebDBDeviceListFanout excludes hosted devices.
             let recipient_bare = self.resolve_encryption_jid(&to).await.to_non_ad();
 
-            // Populate device registry for retry handling
-            let _ = self.get_user_devices(std::slice::from_ref(&to)).await;
-            let own_devices = self.get_user_devices(std::slice::from_ref(own_jid)).await?;
+            // Local registry first; network warm only on miss to avoid
+            // unnecessary LID-migration side effects from get_user_devices
+            let mut recipient_cached = self.get_devices_from_registry(&recipient_bare).await;
+            if recipient_cached.is_none() {
+                let _ = self.get_user_devices(std::slice::from_ref(&to)).await;
+                recipient_cached = self.get_devices_from_registry(&recipient_bare).await;
+            }
 
-            let mut all_dm_jids = Vec::with_capacity(1 + own_devices.len());
-            all_dm_jids.push(recipient_bare);
-            all_dm_jids.extend(own_devices);
+            let mut own_cached = self.get_devices_from_registry(own_jid).await;
+            if own_cached.is_none() {
+                let _ = self.get_user_devices(std::slice::from_ref(own_jid)).await;
+                own_cached = self.get_devices_from_registry(own_jid).await;
+            }
+
+            // Build device list, filter hosted in-place, reuse Vecs
+            let mut all_dm_jids = match recipient_cached {
+                Some(mut devices) => {
+                    devices.retain(|j| !j.is_hosted());
+                    devices
+                }
+                // No record at all — bare JID, server handles fanout
+                None => vec![recipient_bare],
+            };
+
+            if let Some(mut own_devices) = own_cached {
+                own_devices.retain(|j| !j.is_hosted());
+                all_dm_jids.append(&mut own_devices);
+            }
+
+            // Exclude exact sender device (WA Web: isMeDevice in getFanOutList)
+            // so ensure_e2e_sessions never creates a self-session
+            let own_lid = device_snapshot.lid.as_ref();
+            all_dm_jids.retain(|j| {
+                let is_sender = (j.is_same_user_as(own_jid) && j.device == own_jid.device)
+                    || own_lid.is_some_and(|lid| j.is_same_user_as(lid) && j.device == lid.device);
+                !is_sender
+            });
+
+            // Dedup for self-DMs: recipient and own device lists overlap
+            // when sending to own account (WA Web uses Map keyed by toString)
+            {
+                let mut seen = std::collections::HashSet::with_capacity(all_dm_jids.len());
+                all_dm_jids.retain(|j| seen.insert(j.clone()));
+            }
 
             self.ensure_e2e_sessions(&all_dm_jids).await?;
 
@@ -1024,12 +1133,8 @@ impl Client {
                 debug!(target: "Client/TcToken", "Scheduled tc token issuance after send for {}", to);
             }
 
-            let lock_keys = self.build_session_lock_keys(&all_dm_jids).await;
-
-            let mut _session_mutexes = Vec::with_capacity(lock_keys.len());
-            for key in &lock_keys {
-                _session_mutexes.push(self.session_lock_for(key).await);
-            }
+            let lock_jids = self.build_session_lock_keys(&all_dm_jids).await;
+            let _session_mutexes = self.session_mutexes_for(&lock_jids).await;
             let mut _session_guards = Vec::with_capacity(_session_mutexes.len());
             for mutex in &_session_mutexes {
                 _session_guards.push(mutex.lock().await);
@@ -1039,7 +1144,7 @@ impl Client {
 
             let mut stores = store_adapter.as_signal_stores();
 
-            wacore::send::prepare_dm_stanza(
+            let prepared = wacore::send::prepare_dm_stanza(
                 &mut stores,
                 self,
                 own_jid,
@@ -1052,27 +1157,45 @@ impl Client {
                 &extra_stanza_nodes,
                 all_dm_jids,
             )
-            .await?
+            .await?;
+            dm_phash = prepared.phash;
+            prepared.node
         };
 
-        self.send_node(stanza_to_send).await?;
+        let ack = if let Some(phash) = dm_phash
+            && let Some(msg_id) = stanza_to_send
+                .attrs()
+                .optional_string("id")
+                .map(|s| s.into_owned())
+        {
+            let rx = self.register_ack_waiter(&msg_id).await;
+            Some((rx, phash, msg_id))
+        } else {
+            None
+        };
 
-        // Update SKDM recipient cache AFTER server ACK (matches WhatsApp Web behavior).
-        // WA Web only calls markHasSenderKey() after the server confirms receipt.
+        if let Err(e) = self.send_node(stanza_to_send).await {
+            if let Some((_, _, ref msg_id)) = ack {
+                self.response_waiters.lock().await.remove(msg_id);
+            }
+            return Err(e.into());
+        }
+
+        if let Some((rx, phash, msg_id)) = ack {
+            self.spawn_phash_validation(rx, phash, tc_issue_target.clone(), false, msg_id);
+        }
+
         if let Some(update) = skdm_update {
             self.update_sender_key_devices(&update.to_str, &update.devices)
                 .await;
-            // Invalidate device registry for users whose devices returned 406
-            // so the next send re-fetches from server (without stale devices)
             for user in &update.stale_users {
                 self.invalidate_device_cache(user).await;
             }
         }
 
         // Flush cached Signal state to DB after encryption
-        if let Err(e) = self.flush_signal_cache().await {
-            log::error!("Failed to flush signal cache after send_message_impl: {e:?}");
-        }
+        self.flush_signal_cache_logged("send_message_impl", None)
+            .await;
 
         // Issue new tc token after send if a bucket boundary was crossed.
         // Fire-and-forget so send_message returns without waiting for the IQ
@@ -1137,18 +1260,23 @@ impl Client {
 
         // Resolve the destination to a LID user string once — reused for
         // tctoken lookup, issuance, and cstoken HMAC input.
-        let resolved_lid_user = if to.is_lid() {
-            Some(to.user.clone())
+        let cached_lid = if to.is_lid() {
+            None
         } else {
             self.lid_pn_cache.get_current_lid(&to.user).await
         };
-        let token_jid = resolved_lid_user.as_deref().unwrap_or(&to.user).to_string();
+        let resolved_lid_user: Option<&str> = if to.is_lid() {
+            Some(&to.user)
+        } else {
+            cached_lid.as_deref()
+        };
+        let token_jid: &str = resolved_lid_user.unwrap_or(&to.user);
 
         let backend = self.persistence_manager.backend();
         let tc_config = self.tc_token_config().await;
 
         // Look up existing tctoken
-        let existing = match backend.get_tc_token(&token_jid).await {
+        let existing = match backend.get_tc_token(token_jid).await {
             Ok(entry) => entry,
             Err(e) => {
                 log::warn!(target: "Client/TcToken", "Failed to get tc_token for {}: {e}", token_jid);
@@ -1176,7 +1304,7 @@ impl Client {
                         && !entry.token.is_empty() =>
                 {
                     extra_nodes.push(build_tc_token_node(&entry.token));
-                    return (should_issue_after_send, Some(token_jid));
+                    return (should_issue_after_send, Some(token_jid.to_string()));
                 }
                 _ => {
                     // cstoken fallback — gated by wa_nct_token_send_enabled
@@ -1192,7 +1320,7 @@ impl Client {
                         // HMAC input is "user@lid" (account LID without device suffix),
                         // matching WA Web's accountLid.toString()
                         let recipient_lid =
-                            wacore_binary::jid::Jid::new(lid_user, "lid").to_string();
+                            wacore_binary::Jid::new(*lid_user, Server::Lid).to_string();
                         let cs_token = compute_cs_token(salt, &recipient_lid);
                         extra_nodes.push(build_cs_token_node(&cs_token));
                         log::debug!(target: "Client/CsToken", "Attached cstoken for {} (NCT fallback)", to);
@@ -1230,7 +1358,7 @@ impl Client {
     }
 
     /// Returns true if at least one token was persisted.
-    async fn store_issued_tc_tokens(
+    pub(crate) async fn store_issued_tc_tokens(
         &self,
         tokens: &[wacore::iq::tctoken::ReceivedTcToken],
     ) -> bool {
@@ -1330,17 +1458,15 @@ impl Client {
             return;
         };
 
-        let token_jid = if sender.is_lid() {
-            sender.user.clone()
+        let resolved_lid = if sender.is_lid() {
+            None
         } else {
-            match self.lid_pn_cache.get_current_lid(&sender.user).await {
-                Some(lid) => lid,
-                None => sender.user.clone(),
-            }
+            self.lid_pn_cache.get_current_lid(&sender.user).await
         };
+        let token_jid: &str = resolved_lid.as_deref().unwrap_or(&sender.user);
 
         let backend = self.persistence_manager.backend();
-        let entry = match backend.get_tc_token(&token_jid).await {
+        let entry = match backend.get_tc_token(token_jid).await {
             Ok(Some(e)) => e,
             _ => return,
         };
@@ -1390,18 +1516,16 @@ impl Client {
     pub(crate) async fn lookup_tc_token_for_jid(&self, jid: &Jid) -> Option<Vec<u8>> {
         use wacore::iq::tctoken::is_tc_token_expired_with;
 
-        let token_jid = if jid.is_lid() {
-            jid.user.clone()
+        let resolved_lid = if jid.is_lid() {
+            None
         } else {
-            match self.lid_pn_cache.get_current_lid(&jid.user).await {
-                Some(lid) => lid,
-                None => jid.user.clone(),
-            }
+            self.lid_pn_cache.get_current_lid(&jid.user).await
         };
+        let token_jid: &str = resolved_lid.as_deref().unwrap_or(&jid.user);
 
         let tc_config = self.tc_token_config().await;
         let backend = self.persistence_manager.backend();
-        match backend.get_tc_token(&token_jid).await {
+        match backend.get_tc_token(token_jid).await {
             Ok(Some(entry))
                 if !entry.token.is_empty()
                     && !is_tc_token_expired_with(entry.token_timestamp, &tc_config) =>
@@ -1419,16 +1543,29 @@ impl Client {
     /// Build sorted, deduplicated per-device session lock keys.
     /// INVARIANT: Keys are sorted to prevent deadlocks when acquiring multiple
     /// session locks (e.g. DM sends that encrypt for recipient + own devices).
-    /// Keys match the decrypt path format so send and receive serialize correctly.
-    pub(crate) async fn build_session_lock_keys(&self, device_jids: &[Jid]) -> Vec<String> {
-        let mut keys = Vec::with_capacity(device_jids.len());
+    /// Resolve encryption JIDs and sort for deadlock-free lock acquisition.
+    pub(crate) async fn build_session_lock_keys(&self, device_jids: &[Jid]) -> Vec<Jid> {
+        let mut keys: Vec<Jid> = Vec::with_capacity(device_jids.len());
         for jid in device_jids {
-            let enc_jid = self.resolve_encryption_jid(jid).await;
-            keys.push(enc_jid.to_protocol_address_string());
+            keys.push(self.resolve_encryption_jid(jid).await);
         }
-        keys.sort_unstable();
-        keys.dedup();
+        keys.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
+        keys.dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());
         keys
+    }
+
+    /// Fetch per-device session mutexes in deadlock-free order.
+    pub(crate) async fn session_mutexes_for(
+        &self,
+        jids: &[Jid],
+    ) -> Vec<std::sync::Arc<async_lock::Mutex<()>>> {
+        let mut mutexes = Vec::with_capacity(jids.len());
+        let mut buf = wacore::types::jid::make_address_buffer();
+        for jid in jids {
+            wacore::types::jid::write_protocol_address_to(jid, &mut buf);
+            mutexes.push(self.session_lock_for(&buf).await);
+        }
+        mutexes
     }
 
     /// Build tctoken timing config from AB props, falling back to defaults.
@@ -1470,7 +1607,7 @@ impl Client {
         }
 
         if let Some(lid_user) = self.lid_pn_cache.get_current_lid(&jid.user).await {
-            Jid::new(&lid_user, "lid")
+            Jid::new(&lid_user, Server::Lid)
         } else {
             jid.to_non_ad()
         }
@@ -1491,7 +1628,7 @@ impl Client {
             self.resolve_to_lid_jid(jid).await
         } else if jid.is_lid() {
             if let Some(pn) = self.lid_pn_cache.get_phone_number(&jid.user).await {
-                Jid::new(&pn, "s.whatsapp.net")
+                Jid::new(&pn, Server::Pn)
             } else {
                 jid.to_non_ad()
             }
@@ -1562,19 +1699,7 @@ mod tests {
         );
         assert_eq!(edit_attr.to_string_val(), "7");
 
-        let revoke_message = wa::Message {
-            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-                key: Some(wa::MessageKey {
-                    remote_jid: Some(to.to_string()),
-                    from_me: Some(from_me),
-                    id: Some(message_id.clone()),
-                    participant,
-                }),
-                r#type: Some(wa::message::protocol_message::Type::Revoke as i32),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
+        let revoke_message = build_revoke_message(&to, from_me, message_id.clone(), participant);
 
         let proto_msg = revoke_message.protocol_message.unwrap();
         let key = proto_msg.key.unwrap();
@@ -1614,19 +1739,8 @@ mod tests {
         );
         assert_eq!(edit_attr.to_string_val(), "8");
 
-        let revoke_message = wa::Message {
-            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-                key: Some(wa::MessageKey {
-                    remote_jid: Some(to.to_string()),
-                    from_me: Some(from_me),
-                    id: Some(message_id.clone()),
-                    participant: participant.clone(),
-                }),
-                r#type: Some(wa::message::protocol_message::Type::Revoke as i32),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
+        let revoke_message =
+            build_revoke_message(&to, from_me, message_id.clone(), participant.clone());
 
         let proto_msg = revoke_message.protocol_message.unwrap();
         let key = proto_msg.key.unwrap();
@@ -2165,16 +2279,16 @@ mod tests {
             let send_lock_keys = client.build_session_lock_keys(&devices).await;
 
             assert_eq!(send_lock_keys.len(), 3);
-            assert_eq!(send_lock_keys[0], "100000012345678:33@lid.0");
-            assert_eq!(send_lock_keys[1], "100000012345678:5@lid.0");
-            assert_eq!(send_lock_keys[2], "100000012345678@lid.0");
+            // Sorted by (server, user, device_numeric): 0, 5, 33
+            assert_eq!(send_lock_keys[0].device, 0);
+            assert_eq!(send_lock_keys[1].device, 5);
+            assert_eq!(send_lock_keys[2].device, 33);
 
-            // Send keys must match what the decrypt path would use
+            // Send keys must cover every device
             for device_jid in &devices {
-                let decrypt_key = device_jid.to_protocol_address().to_string();
                 assert!(
-                    send_lock_keys.contains(&decrypt_key),
-                    "decrypt key {decrypt_key} not in send keys: {send_lock_keys:?}"
+                    send_lock_keys.contains(device_jid),
+                    "device {device_jid} not in send keys: {send_lock_keys:?}"
                 );
             }
 
@@ -2286,21 +2400,21 @@ mod tests {
                 .to_non_ad();
 
             let all_dm_jids = vec![recipient_bare.clone(), own_device_5.clone()];
-            let lock_keys = client.build_session_lock_keys(&all_dm_jids).await;
+            let lock_jids = client.build_session_lock_keys(&all_dm_jids).await;
 
             // Recipient lock key must be BARE (device 0), matching decrypt path
             assert_eq!(
                 recipient_bare.to_protocol_address_string(),
                 "100000012345678@lid.0"
             );
-            assert!(lock_keys.contains(&"100000012345678@lid.0".to_string()));
+            assert!(lock_jids.contains(&recipient_bare));
 
             // Own device lock key must be device-specific
-            assert!(lock_keys.contains(&"999999999999:5@c.us.0".to_string()));
+            assert!(lock_jids.contains(&own_device_5));
 
             // Device-specific recipient key must NOT be present
             assert!(
-                !lock_keys.contains(&"100000012345678:33@lid.0".to_string()),
+                !lock_jids.contains(&recipient_device33),
                 "recipient must NOT use device-specific address"
             );
         }

@@ -26,11 +26,12 @@ use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, KeyInit};
 use ctr::Ctr128BE;
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use rand::RngExt;
 use sha2::Sha256;
+use wacore_binary::SERVER_JID;
 use wacore_binary::builder::NodeBuilder;
-use wacore_binary::jid::SERVER_JID;
-use wacore_binary::node::{Node, NodeContent};
+use wacore_binary::{Node, NodeContentRef, NodeRef};
 
 // Type aliases
 type Aes256Ctr = Ctr128BE<aes::Aes256>;
@@ -48,6 +49,32 @@ const PAIR_CODE_IV_SIZE: usize = 16;
 /// Crockford Base32 alphabet used for pair codes.
 /// Excludes 0, I, O, U to prevent visual confusion.
 const CROCKFORD_ALPHABET: &[u8; 32] = b"123456789ABCDEFGHJKLMNPQRSTVWXYZ";
+
+/// RFC 2898 PBKDF2 using HMAC-SHA256. Replaces the `pbkdf2` crate dependency
+/// which hasn't released a digest 0.11-compatible stable version yet.
+fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], rounds: u32, output: &mut [u8]) {
+    use hmac::KeyInit as _;
+    for (i, chunk) in output.chunks_mut(32).enumerate() {
+        let mut u = {
+            let mut mac =
+                Hmac::<Sha256>::new_from_slice(password).expect("HMAC accepts any key length");
+            mac.update(salt);
+            mac.update(&((i as u32) + 1).to_be_bytes());
+            let result: [u8; 32] = mac.finalize().into_bytes().into();
+            result
+        };
+        chunk.copy_from_slice(&u[..chunk.len()]);
+        for _ in 1..rounds {
+            let mut mac =
+                Hmac::<Sha256>::new_from_slice(password).expect("HMAC accepts any key length");
+            mac.update(&u);
+            u = mac.finalize().into_bytes().into();
+            for (a, b) in chunk.iter_mut().zip(u.iter()) {
+                *a ^= b;
+            }
+        }
+    }
+}
 
 /// Validity duration for pair codes (approximately).
 const PAIR_CODE_VALIDITY_SECS: u64 = 180;
@@ -193,7 +220,7 @@ impl PairCodeUtils {
     /// Consider wrapping in `spawn_blocking` for async contexts.
     pub fn derive_key(code: &str, salt: &[u8; PAIR_CODE_SALT_SIZE]) -> [u8; 32] {
         let mut key = [0u8; 32];
-        pbkdf2::pbkdf2_hmac::<Sha256>(code.as_bytes(), salt, PAIR_CODE_PBKDF2_ITERATIONS, &mut key);
+        pbkdf2_hmac_sha256(code.as_bytes(), salt, PAIR_CODE_PBKDF2_ITERATIONS, &mut key);
         key
     }
 
@@ -314,12 +341,11 @@ impl PairCodeUtils {
     }
 
     /// Parses the stage 1 response to extract the pairing ref.
-    pub fn parse_companion_hello_response(node: &Node) -> Option<Vec<u8>> {
+    pub fn parse_companion_hello_response(node: &NodeRef<'_>) -> Option<Vec<u8>> {
         node.get_optional_child_by_tag(&["link_code_companion_reg"])
             .and_then(|n| n.get_optional_child_by_tag(&["link_code_pairing_ref"]))
-            .and_then(|n| n.content.as_ref())
-            .and_then(|c| match c {
-                NodeContent::Bytes(b) => Some(b.clone()),
+            .and_then(|n| match n.content.as_deref() {
+                Some(NodeContentRef::Bytes(b)) => Some(b.to_vec()),
                 _ => None,
             })
     }
@@ -445,9 +471,8 @@ impl PairCodeUtils {
         // AES-GCM encrypt the bundle
         let cipher = Aes256Gcm::new_from_slice(&enc_key)
             .map_err(|e| PairCodeError::CryptoError(format!("AES-GCM init failed: {e}")))?;
-        let nonce = aes_gcm::Nonce::from_slice(&iv);
         let encrypted_bundle = cipher
-            .encrypt(nonce, bundle.as_slice())
+            .encrypt((&iv).into(), bundle.as_slice())
             .map_err(|e| PairCodeError::CryptoError(format!("AES-GCM encryption failed: {e}")))?;
 
         // Wrapped bundle = salt (32) + iv (12) + encrypted_bundle (96 + 16 = 112)
