@@ -11,7 +11,7 @@ description = "Appstate for WhatsApp protocol"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = []
+default = ["simd"]
 simd = ["wacore-binary/simd"]
 
 [dependencies]

@@ -3521,17 +3521,6 @@ impl Client {
         snapshot.lid.clone()
     }
 
-    /// Resolve a LID to its associated phone number, if known.
-    pub async fn get_phone_for_lid(&self, lid: &str) -> Option<String> {
-        self.lid_pn_cache.get_phone_number(lid).await
-    }
-
-    /// Resolve a phone number to its associated LID, if known.
-    pub async fn get_lid_for_phone(&self, phone: &str) -> Option<String> {
-        self.lid_pn_cache.get_current_lid(phone).await
-    }
-
-
     pub(crate) async fn require_pn(&self) -> Result<Jid> {
         self.get_pn().await.ok_or(ClientError::NotLoggedIn.into())
     }
